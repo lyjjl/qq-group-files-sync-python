@@ -23,10 +23,11 @@
 
 1) 准备一个 OneBot11 协议端（开发&测试使用 LuckyLilliaBot）。
 2) 在协议端开启 **OneBot11 WebSocket 服务器**，并确认地址（例如：`ws://127.0.0.1:3001`）。
-3) 使用 [uv](https://docs.astral.sh/uv/getting-started/installation) 安装依赖：
-4) 在项目目录根据[配置示例](#配置示例)示例创建 `config.toml`（当然，首次运行会自动生成一份带注释的示例配置）
-5) `uv run main.py [OPTIONS] COMMAND [ARGS]...`
-6) Enjoy!
+3) [安装 uv](https://docs.astral.sh/uv/getting-started/installation)
+4) 使用 `uv sync` 安装依赖：
+5) 在项目目录根据[配置示例](#配置示例)创建 `config.toml`（当然，首次运行会自动生成一份带注释的示例配置）
+6) `uv run main.py [OPTIONS] COMMAND [ARGS]...`
+7) Enjoy!
 
 ```bash
 # 安装依赖
