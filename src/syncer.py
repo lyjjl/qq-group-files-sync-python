@@ -4,10 +4,14 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from urllib.parse import urlparse
 
 import aiofiles
 import httpx
@@ -108,30 +112,21 @@ def _format_size(size: int) -> str:
     return f"{size / div:.1f} {'KMGTPE'[exp]}B"
 
 
-def _normalize_download_url(raw: Any) -> str:
-    """尝试规范化返回的群文件 URL。
 
-    有些时候好像会返回 "//tjc-download.ftn.qq.com/..." 或 不带协议的路径
-    httpx 要求明确的 "http://" 或 "https://" 前缀，处理一下
-    """
-
-    if raw is None:
-        return ""
-    url = str(raw).strip()
-    if not url:
-        return ""
-
-    if url.startswith("//"):
-        return "https:" + url
-
-    lower = url.lower()
-    if lower.startswith("http://") or lower.startswith("https://"):
-        return url
-
-    if "://" not in url and ("/" in url or "." in url):
-        return "https://" + url.lstrip("/")
-
-    return url
+def _is_valid_group_file_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in {"http", "https"}:
+        return False
+    if not p.netloc:
+        return False
+    if not p.path.startswith("/ftn_handler/"):
+        return False
+    if not p.netloc.endswith("ftn.qq.com"):
+        return False
+    return True
 
 
 class GroupFileSyncer:
@@ -148,6 +143,45 @@ class GroupFileSyncer:
         self.concurrency = max(1, int(concurrency))
         self._timestamp_cache: dict[str, dict[str, FileTimestampRecord]] = {}
         self.ignore = ignore
+
+        # invalid files (你妈的sbtx，封文件好玩吗)
+        self._invalid_files: dict[str, set[str]] = defaultdict(set)
+        self._invalid_log_lock = asyncio.Lock()
+
+    def get_invalid_counts(self) -> dict[str, int]:
+        return {gid: len(paths) for gid, paths in self._invalid_files.items() if paths}
+
+    def get_invalid_total(self) -> int:
+        return sum(len(v) for v in self._invalid_files.values())
+
+    async def _record_invalid_file(self, group_id_str: str, rel_path: str) -> None:
+        rel_path = (rel_path or "").strip().replace("\\", "/")
+        if not rel_path:
+            return
+
+        if rel_path in self._invalid_files[group_id_str]:
+            return
+        self._invalid_files[group_id_str].add(rel_path)
+
+        try:
+            raw_path = (getattr(self.cfg, "invalid_files_log", "") or "").strip()
+            if raw_path:
+                log_path = Path(raw_path).expanduser()
+                if str(raw_path).endswith(("/", "\\")) or (log_path.exists() and log_path.is_dir()):
+                    log_path = log_path / "invalidFiles.log"
+                log_path = log_path.resolve()
+            else:
+                log_path = Path(self.cfg.log_file or "./logs/main.log").expanduser().resolve().parent / "invalidFiles.log"
+
+            log_dir = log_path.parent
+            log_dir.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            line = f"{ts}\t{group_id_str}\t{rel_path}\n"
+            async with self._invalid_log_lock:
+                async with aiofiles.open(log_path, "a", encoding="utf-8") as af:
+                    await af.write(line)
+        except Exception:
+            logging.getLogger(__name__).exception("failed to write invalidFiles.log")
 
     async def get_complete_file_list(self, bot: OneBotWsClient, group_id_str: str) -> tuple[list[GroupFileInfo], list[GroupFolderInfo]]:
         group_id_num = parse_group_numeric_id(group_id_str)
@@ -171,10 +205,11 @@ class GroupFileSyncer:
                 if not fid or fid in seen_file:
                     continue
                 seen_file.add(fid)
+                fname = str(f.get("file_name") or "").strip()
                 files.append(
                     GroupFileInfo(
                         file_id=fid,
-                        file_name=str(f.get("file_name", "")),
+                        file_name=fname,
                         busid=int(f.get("busid", 0)),
                         file_size=int(f.get("file_size", 0)),
                         upload_time=_safe_int(f.get("upload_time")),
@@ -369,7 +404,7 @@ class GroupFileSyncer:
 
         self.fs.mkdir_all(group_root)
 
-        await self._download_updates(bot, group_id_str, group_root, pred.update_file_map)
+        await self._download_updates(bot, group_id_str, group_root, pred.update_file_map, mirror=mirror)
 
         if mirror:
             await self._cleanup_extra_files(pred.status, group_root)
@@ -582,6 +617,8 @@ class GroupFileSyncer:
         group_id_str: str,
         group_root: str,
         update_map: dict[str, GroupFileInfo],
+        *,
+        mirror: bool,
     ) -> None:
         if not update_map:
             return
@@ -595,15 +632,36 @@ class GroupFileSyncer:
             async def download_one(full_rel: str, f: GroupFileInfo) -> None:
                 async with semaphore:
                     try:
+                        safe_name = (f.file_name or "").strip()
+                        if not safe_name:
+                            logging.getLogger(__name__).warning(
+                                "skip abnormal file record (empty file_name): group=%s folder_path=%r file_id=%s busid=%s",
+                                group_id_str,
+                                f.folder_path,
+                                f.file_id,
+                                f.busid,
+                            )
+                            return
+
+                        rel_path = group_relative_file_path(f.folder_path, safe_name)
                         url_res = await bot.call_api(
                             "get_group_file_url",
                             {"group_id": group_id_num, "file_id": f.file_id, "busid": f.busid},
                         )
                         data = url_res.data or {}
                         raw_url = data.get("url")
-                        url = _normalize_download_url(raw_url)
-                        if not url or not (url.lower().startswith("http://") or url.lower().startswith("https://")):
-                            raise RuntimeError(f"invalid download url: {raw_url!r} -> {url!r}")
+                        url = str(raw_url).strip() if raw_url is not None else ""
+                        if not url or not _is_valid_group_file_url(url):
+                            logging.getLogger(__name__).debug(
+                                "group file invalid (no url), skipped: group=%s path=%s file_id=%s busid=%s url=%r",
+                                group_id_str,
+                                rel_path,
+                                f.file_id,
+                                f.busid,
+                                raw_url,
+                            )
+                            await self._record_invalid_file(group_id_str, rel_path)
+                            return
 
                         target = self.fs.base_path / Path(full_rel)
                         target.parent.mkdir(parents=True, exist_ok=True)
@@ -613,10 +671,26 @@ class GroupFileSyncer:
                         tmp = target.with_name(f"{target.name}.part.{tmp_suffix}")
 
                         async with client.stream("GET", url) as resp:
+                            if resp.status_code in {403, 404, 410}:
+                                logging.getLogger(__name__).debug(
+                                    "group file invalid (http %s), skipped: group=%s path=%s full_rel=%s",
+                                    resp.status_code,
+                                    group_id_str,
+                                    rel_path,
+                                    full_rel,
+                                )
+                                await self._record_invalid_file(group_id_str, rel_path)
+                                return
                             resp.raise_for_status()
                             async with aiofiles.open(tmp, "wb") as af:
                                 async for chunk in resp.aiter_bytes():
                                     await af.write(chunk)
+
+                        if target.exists() and target.is_dir():
+                            if mirror:
+                                shutil.rmtree(target)
+                            else:
+                                raise IsADirectoryError(f"target exists as directory: {target}")
 
                         os.replace(tmp, target)
 

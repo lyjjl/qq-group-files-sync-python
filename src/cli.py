@@ -31,6 +31,7 @@ _LEVEL_MAP: dict[str, int] = {
     "warn": logging.WARNING,
     "warning": logging.WARNING,
     "error": logging.ERROR,
+    "none": logging.CRITICAL + 10,
 }
 
 
@@ -62,12 +63,32 @@ class _HttpxLevelDowngradeFilter(logging.Filter):
 
 
 def _setup_logging(log_file: str, log_level: str) -> int:
-    level = _LEVEL_MAP.get((log_level or "").strip().lower(), logging.INFO)
+    lvl = (log_level or "").strip().lower()
+    if lvl == "none":
+        # Disable all logging output (console + files).
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            try:
+                root.removeHandler(h)
+            except Exception:
+                pass
+        logging.basicConfig(level=logging.CRITICAL + 10, handlers=[logging.NullHandler()])
+        logging.disable(logging.CRITICAL)
+        return logging.CRITICAL + 10
 
-    # Console handler
-    console_handler = RichHandler(rich_tracebacks=(level <= logging.DEBUG))
+    level = _LEVEL_MAP.get(lvl, logging.INFO)
+
+    # Console handler (Rich)
+    # IMPORTANT: RichHandler already renders time/level; keep console formatter minimal to avoid duplication.
+    console_handler = RichHandler(
+        rich_tracebacks=(level <= logging.DEBUG),
+        show_time=True,
+        show_level=True,
+        show_path=False,
+    )
     console_handler.setLevel(level)
     console_handler.addFilter(_HttpxNoiseFilter(level))
+    console_handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
 
     # File handlers
     log_path = Path(log_file or "./logs/main.log").expanduser().resolve()
@@ -78,17 +99,27 @@ def _setup_logging(log_file: str, log_level: str) -> int:
     main_handler = logging.FileHandler(log_path, encoding="utf-8")
     main_handler.setLevel(logging.DEBUG)
     main_handler.addFilter(_HttpxLevelDowngradeFilter())
+    main_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
 
     # error.log 包含 warn 和 err
     error_handler = logging.FileHandler(err_file, encoding="utf-8")
     error_handler.setLevel(logging.WARNING)
-
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[console_handler, main_handler, error_handler],
+    error_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     )
+
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        try:
+            root.removeHandler(h)
+        except Exception:
+            pass
+    root.setLevel(logging.DEBUG)
+    root.addHandler(console_handler)
+    root.addHandler(main_handler)
+    root.addHandler(error_handler)
 
     if level > logging.DEBUG:
         logging.getLogger("httpx").setLevel(logging.INFO)
@@ -121,11 +152,13 @@ async def _sync_all(
         console.print("配置文件中没有配置群组列表，请在 config.toml 中添加 groups 配置")
         return
 
-    console.print(f"即将开始同步 {len(cfg.groups)} 个群组的文件")
+    # pull all: skip groups with no_pull=true
+    groups_to_run = [g for g in cfg.groups if not bool(getattr(g, "no_pull", False))]
+    console.print(f"即将开始同步 {len(groups_to_run)} 个群组的文件")
 
     ok = 0
     failed: list[str] = []
-    for g in cfg.groups:
+    for g in groups_to_run:
         gid = g.id
         alias = g.alias or gid
         try:
@@ -145,6 +178,22 @@ async def _sync_all(
     msg = ("对比完成（未执行修改）！" if plan else "同步全部完成！") + f"成功: {ok} 个群组"
     if failed:
         msg += f"，失败: {len(failed)} 个群组 ({', '.join(failed)})"
+
+    # invalid files are not treated as errors, but we still report them
+    invalid_counts = syncer.get_invalid_counts()
+    if invalid_counts:
+        total_invalid = 0
+        msg += "\n失效文件统计:"
+        for g in groups_to_run:
+            gid = g.id
+            n = int(invalid_counts.get(gid, 0))
+            if n <= 0:
+                continue
+            total_invalid += n
+            msg += f"\n- {gid}: {n}"
+        msg += f"\n总失效文件: {total_invalid}"
+        msg += f"\n详见 {getattr(cfg, 'invalid_files_log', 'invalidFiles.log')}"
+
     msg += f"\n文件已保存到: {fs.base_path}"
     console.print(Panel(msg, title=("对比完成" if plan else "同步完成"), expand=False))
 
@@ -224,7 +273,8 @@ async def _interactive(cfg, fs: FileSystemManager, bot: OneBotWsClient, syncer: 
             return
 
         if text.startswith(".同步全部"):
-            await _send_group_text(bot, group_id_num, f"即将开始同步 {len(cfg.groups)} 个群组的文件")
+            groups_to_run = [g for g in cfg.groups if not bool(getattr(g, "no_pull", False))]
+            await _send_group_text(bot, group_id_num, f"即将开始同步 {len(groups_to_run)} 个群组的文件")
             await _sync_all(cfg, fs, bot, syncer, build_dashboard=True, mirror=False, plan=False)
             await _send_group_text(bot, group_id_num, "同步全部已结束")
             return
@@ -334,6 +384,9 @@ def pull(
 
             title = "对比完成" if plan else "同步完成"
             body = f"{gid_str}\n文件已保存到: {fs.base_path}"
+            invalid_n = int(syncer.get_invalid_counts().get(gid_str, 0))
+            if invalid_n:
+                body += f"\n失效文件: {invalid_n}（详见 {getattr(cfg, 'invalid_files_log', 'invalidFiles.log')}）"
             if web and (not plan):
                 body += "\n展示页面：已生成/更新"
             console.print(Panel(body, title=title, expand=False))
@@ -393,7 +446,9 @@ def push(
                     return
                 ok = 0
                 failed: list[str] = []
-                for g in cfg.groups:
+                # push all: skip groups with no_push=true
+                groups_to_run = [g for g in cfg.groups if not bool(getattr(g, "no_push", False))]
+                for g in groups_to_run:
                     gid = g.id
                     alias = g.alias or gid
                     try:

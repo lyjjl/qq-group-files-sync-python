@@ -33,6 +33,8 @@ class GroupConfig(BaseModel):
     id: str = Field(alias="id")
     alias: str = Field(default="", alias="alias")
     description: str = Field(default="", alias="description")
+    no_pull: bool = Field(default=False, alias="noPull")
+    no_push: bool = Field(default=False, alias="noPush")
 
 
 class WebConfig(BaseModel):
@@ -48,6 +50,7 @@ class AppConfig(BaseModel):
     file_system: FileSystemConfig = Field(default_factory=FileSystemConfig, alias="fileSystem")
     log_file: str = Field(default="./logs/main.log", alias="logFile")
     log_level: str = Field(default="info", alias="logLevel")
+    invalid_files_log: str = Field(default="./logs/invalidFiles.log", alias="invalidFilesLog")
     groups: list[GroupConfig] = Field(default_factory=list, alias="groups")
     web: WebConfig = Field(default_factory=WebConfig, alias="web")
 
@@ -73,6 +76,7 @@ def default_config() -> AppConfig:
         file_system=FileSystemConfig(local_path="./data"),
         log_file="./logs/main.log",
         log_level="info",
+        invalid_files_log="./logs/invalidFiles.log",
         groups=[
             GroupConfig(
                 id="QQ-Group:123456",
@@ -172,8 +176,10 @@ def render_config_toml(cfg: AppConfig) -> str:
 
     lines.append("# 日志：main.log（全量）与 error.log（warn/error）")
     lines.append(f"log_file = {_toml_quote(cfg.log_file)}")
-    lines.append("# 控制台日志级别：debug / info / warn / error")
+    lines.append("# 控制台日志级别：none / debug / info / warn / error")
     lines.append(f"log_level = {_toml_quote(cfg.log_level)}")
+    lines.append("# 失效文件日志：每次拉取失败（过期/无下载链接等）会追加到该文件")
+    lines.append(f"invalid_files_log = {_toml_quote(cfg.invalid_files_log)}")
     lines.append("")
 
     lines.append("# 需要同步的群列表：每个群一个 [[groups]]")
@@ -184,12 +190,18 @@ def render_config_toml(cfg: AppConfig) -> str:
             lines.append(f"id = {_toml_quote(g.id)}")
             lines.append(f"alias = {_toml_quote(g.alias)}")
             lines.append(f"description = {_toml_quote(g.description)}")
+            lines.append("# pull all 时跳过该群（单群 pull 不受影响）")
+            lines.append(f"no_pull = {'true' if bool(getattr(g, 'no_pull', False)) else 'false'}")
+            lines.append("# push all 时跳过该群（单群 push 不受影响）")
+            lines.append(f"no_push = {'true' if bool(getattr(g, 'no_push', False)) else 'false'}")
             lines.append("")
     else:
         lines.append("[[groups]]")
         lines.append("id = \"QQ-Group:123456\"")
         lines.append("alias = \"示例名称\"")
         lines.append("description = \"实例介绍\"")
+        lines.append("no_pull = false")
+        lines.append("no_push = false")
         lines.append("")
 
     lines.append("[web]")
