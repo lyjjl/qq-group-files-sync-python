@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# uv
+uv.lock
+
+# Local app state
+config.toml
+config.json
+config.jsonl
+data/
+logs/
+test_data/
+
+# Editor/IDE
+.idea/
+.vscode/

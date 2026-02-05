@@ -1,0 +1,33 @@
+[project]
+name = "qq-group-files-sync"
+version = "0.2.0"
+description = "在多个QQ群之间同步群文件，并生成可浏览的静态页面"
+readme = "README.md"
+requires-python = ">=3.14"
+license = { file = "LICENSE" }
+authors = [{ name = "sealdice" }]
+dependencies = [
+  "typer>=0.12",
+  "rich>=13.7",
+  "pydantic>=2.6",
+  "websockets>=12.0",
+  "httpx>=0.27.0",
+  "aiofiles>=23.2",
+  "jinja2>=3.1",
+]
+
+[project.scripts]
+qq-sync = "cli:app"
+# 要用这个的话需要把下面的 package 改成 true
+
+[tool.uv]
+# 从源码运行：仅同步并安装依赖，不把本项目打包/安装到虚拟环境。
+# 配合根目录 main.py（会把 ./src 加到 sys.path）即可。
+package = false
+
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qq_group_files_sync"]
