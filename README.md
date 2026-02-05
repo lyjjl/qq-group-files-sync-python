@@ -2,10 +2,15 @@
 
 在多个QQ群和本地储存之间同步群文件的小工具，可选生成一个可浏览的静态页面。
 
-### 本工具的诞生离不开这些优秀的前辈:
+### 本工具的诞生离不开这些优秀的前辈
 
-- [qq-group-files-sync](github.com/sealdice/qq-group-files-sync)
-- [LuckyLilliaBot](github.com/LLOneBot/LuckyLilliaBot)
+- [qq-group-files-sync](https://github.com/sealdice/qq-group-files-sync)
+- [LuckyLilliaBot](https://github.com/LLOneBot/LuckyLilliaBot)
+
+### 另外感谢这些给予我知识和鼓励的老师们
+
+- [Gemini](https://gemini.google.com)
+- [ChatGPT](https://chatgpt.com)
 
 功能：
 
@@ -18,7 +23,7 @@
 
 1) 准备一个 OneBot11 协议端（开发&测试使用 LuckyLilliaBot）。
 2) 在协议端开启 **OneBot11 WebSocket 服务器**，并确认地址（例如：`ws://127.0.0.1:3001`）。
-3) 使用 uv 安装依赖：
+3) 使用 [uv](https://docs.astral.sh/uv/getting-started/installation) 安装依赖：
 4) 在项目目录根据[配置示例](#配置示例)示例创建 `config.toml`（当然，首次运行会自动生成一份带注释的示例配置）
 5) `uv run main.py [OPTIONS] COMMAND [ARGS]...`
 6) Enjoy!
