@@ -154,7 +154,7 @@ class GroupFileSyncer:
     def get_invalid_total(self) -> int:
         return sum(len(v) for v in self._invalid_files.values())
 
-    async def _record_invalid_file(self, group_id_str: str, rel_path: str) -> None:
+    async def _record_invalid_file(self, group_id_str: str, rel_path: str, *, reason: str = "") -> None:
         rel_path = (rel_path or "").strip().replace("\\", "/")
         if not rel_path:
             return
@@ -176,7 +176,8 @@ class GroupFileSyncer:
             log_dir = log_path.parent
             log_dir.mkdir(parents=True, exist_ok=True)
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            line = f"{ts}\t{group_id_str}\t{rel_path}\n"
+            reason = (reason or "").strip()
+            line = f"{ts}\t{group_id_str}\t{rel_path}\t{reason}\n"
             async with self._invalid_log_lock:
                 async with aiofiles.open(log_path, "a", encoding="utf-8") as af:
                     await af.write(line)
@@ -644,10 +645,21 @@ class GroupFileSyncer:
                             return
 
                         rel_path = group_relative_file_path(f.folder_path, safe_name)
-                        url_res = await bot.call_api(
-                            "get_group_file_url",
-                            {"group_id": group_id_num, "file_id": f.file_id, "busid": f.busid},
-                        )
+                        try:
+                            url_res = await bot.call_api(
+                                "get_group_file_url",
+                                {"group_id": group_id_num, "file_id": f.file_id, "busid": f.busid},
+                            )
+                        except asyncio.TimeoutError:
+                            logging.getLogger(__name__).debug(
+                                "group file url timeout, skipped: group=%s path=%s file_id=%s busid=%s",
+                                group_id_str,
+                                rel_path,
+                                f.file_id,
+                                f.busid,
+                            )
+                            await self._record_invalid_file(group_id_str, rel_path, reason="url_timeout")
+                            return
                         data = url_res.data or {}
                         raw_url = data.get("url")
                         url = str(raw_url).strip() if raw_url is not None else ""
@@ -660,7 +672,7 @@ class GroupFileSyncer:
                                 f.busid,
                                 raw_url,
                             )
-                            await self._record_invalid_file(group_id_str, rel_path)
+                            await self._record_invalid_file(group_id_str, rel_path, reason="invalid_url")
                             return
 
                         target = self.fs.base_path / Path(full_rel)
@@ -679,7 +691,11 @@ class GroupFileSyncer:
                                     rel_path,
                                     full_rel,
                                 )
-                                await self._record_invalid_file(group_id_str, rel_path)
+                                await self._record_invalid_file(
+                                    group_id_str,
+                                    rel_path,
+                                    reason=f"http_{resp.status_code}",
+                                )
                                 return
                             resp.raise_for_status()
                             async with aiofiles.open(tmp, "wb") as af:

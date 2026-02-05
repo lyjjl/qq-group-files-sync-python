@@ -128,7 +128,7 @@ class GroupFilePusher:
         console.print(Panel(overview, title=f"镜像推送对比 {group_id_str}", expand=False))
 
         if plan:
-            self._print_plan(group_id_str, remote_folders, to_upload=to_upload, to_replace=to_replace, to_delete=to_delete, ignored_empty=local_empty)
+            self._print_plan(remote_folders, to_upload=to_upload, to_replace=to_replace, to_delete=to_delete, ignored_empty=local_empty)
             return
 
         if local_empty:
@@ -247,7 +247,7 @@ class GroupFilePusher:
         overview.add_row("待上传", str(len(missing_local)))
         console.print(Panel(overview, title=f"推送对比 {group_id_str}", expand=False))
         if plan:
-            self._print_plan(group_id_str, remote_folders, to_upload=sorted(missing_local), to_replace=[], to_delete=[], ignored_empty=sorted(ignored_empty))
+            self._print_plan(remote_folders, to_upload=sorted(missing_local), to_replace=[], to_delete=[], ignored_empty=sorted(ignored_empty))
             return
 
         if ignored_empty:
@@ -414,7 +414,6 @@ class GroupFilePusher:
 
     def _print_plan(
         self,
-        # group_id_str: str,
         remote_folders: dict[str, RemoteFolder],
         *,
         to_upload: list[str],

@@ -371,7 +371,7 @@ def pull(
 
             # 特殊处理没有配置群组的情况
             if not any((g.id or "").strip() == gid_str for g in cfg.groups):
-                from .config import GroupConfig
+                from config import GroupConfig
 
                 cfg.groups.append(GroupConfig(id=gid_str, alias=gid_str, description=""))
 

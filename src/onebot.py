@@ -106,7 +106,11 @@ class OneBotWsClient:
         req: dict[str, Any] = {"action": action, "params": params or {}, "echo": echo}
         await self._ws.send(json.dumps(req, ensure_ascii=False))
 
-        raw = await asyncio.wait_for(fut, timeout=self.request_timeout_s)
+        try:
+            raw = await asyncio.wait_for(fut, timeout=self.request_timeout_s)
+        except Exception:
+            self._pending.pop(echo, None)
+            raise
         return ActionResult(
             status=str(raw.get("status", "")),
             retcode=int(raw.get("retcode", -1)),

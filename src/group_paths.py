@@ -7,7 +7,10 @@ _UNSAFE = re.compile(r"[<>:\"|?*\\/]")
 
 
 def sanitize_component(name: str) -> str:
-    return _UNSAFE.sub("_", name)
+    safe = _UNSAFE.sub("_", name)
+    if safe in {"", ".", ".."}:
+        return "_"
+    return safe
 
 
 def normalize_group_id(group_id: str) -> str:
