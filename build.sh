@@ -186,7 +186,7 @@ NUITKA_ARGS=(
 if [[ "$NUITKA_MODE" == "onefile" ]]; then
   NUITKA_ARGS+=(--onefile)
   if [[ "$RELEASE" == "1" ]]; then
-    NUITKA_ARGS+=(--lto=yes --onefile-compression-level=22)
+    NUITKA_ARGS+=(--lto=yes)
   elif [[ "$ONEFILE_NO_COMPRESSION" == "1" ]]; then
     NUITKA_ARGS+=(--onefile-no-compression)
   fi

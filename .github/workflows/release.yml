@@ -63,7 +63,6 @@ jobs:
             --onefile \
             --follow-imports \
             --lto=yes \
-            --onefile-compression-level=22 \
             --output-dir=dist \
             --output-filename="$OUTPUT_NAME" \
             --include-data-dir=src/templates=templates \
