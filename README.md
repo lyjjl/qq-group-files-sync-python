@@ -2,32 +2,38 @@
 
 在多个QQ群和本地储存之间同步群文件的小工具，可选生成一个可浏览的静态页面。
 
-### 本工具的诞生离不开这些优秀的前辈
+## 目录
 
-- [qq-group-files-sync](https://github.com/sealdice/qq-group-files-sync)
-- [LuckyLilliaBot](https://github.com/LLOneBot/LuckyLilliaBot)
+* [功能特性](#功能特性)
+* [使用方法](#使用)
+* [交互模式指令](#交互模式指令)
+* [同步过程说明](#同步过程说明)
+* [配置示例](#配置示例)
+* [构建方法](#构建)
+* [项目结构](#目录)
+* [其他](#其他)
+* [致谢](#致谢)
 
-### 另外感谢这些给予我知识和鼓励的老师们
+---
 
-- [Gemini](https://gemini.google.com)
-- [ChatGPT](https://chatgpt.com)
+## 功能特性
 
-功能：
+* 群文件下载
+* 增量同步
+* 生成展示界面
+* 通过 OneBot11 **正向 WS 连接** 与协议端通信
 
-- 群文件下载
-- 增量同步
-- 生成展示界面
-- 通过 OneBot11 **正向 WS 连接** 与协议端通信
+---
 
 ## 使用
 
-1) 准备一个 OneBot11 协议端（开发&测试使用 LuckyLilliaBot）。
-2) 在协议端开启 **OneBot11 WebSocket 服务器**，并确认地址（例如：`ws://127.0.0.1:3001`）。
-3) [安装 uv](https://docs.astral.sh/uv/getting-started/installation)
-4) 使用 `uv sync` 安装依赖：
-5) 在项目目录根据[配置示例](#配置示例)创建 `config.toml`（当然，首次运行会自动生成一份带注释的示例配置）
-6) `uv run main.py [OPTIONS] COMMAND [ARGS]...`
-7) Enjoy!
+1. 准备一个 OneBot11 协议端（开发&测试使用 LuckyLilliaBot）。
+2. 在协议端开启 **OneBot11 WebSocket 服务器**，并确认地址（例如：`ws://127.0.0.1:3001`）。
+3. [安装 uv](https://docs.astral.sh/uv/getting-started/installation)
+4. 使用 `uv sync` 安装依赖：
+5. 在项目目录根据[配置示例](#配置示例)创建 `config.toml`（当然，首次运行会自动生成一份带注释的示例配置）
+6. `uv run main.py [OPTIONS] COMMAND [ARGS]...`
+7. Enjoy!
 
 ```bash
 # 安装依赖
@@ -53,31 +59,40 @@ uv run main.py push QQ-Group:123456
 
 # 进入交互等待模式（在群里发指令控制同步）
 uv run main.py watch
+
 ```
 
 日志默认写入：
 
-- `./logs/main.log`：全部日志（含 debug）
-- `./logs/error.log`：警告与错误（warn/error）
+* `./logs/main.log`：全部日志（含 debug）
+* `./logs/error.log`：警告与错误（warn/error）
 
 控制台输出级别由 `logLevel` 控制；httpx/httpcore 的请求明细会被视为 debug 级别。
+
+---
 
 ## 交互模式指令
 
 在群内发送：
 
-- `.同步当前`
+* `.同步当前`
+* 同步当前群的群文件，完成后自动生成展示页面
 
-  - 同步当前群的群文件，完成后自动生成展示页面
-- `.同步文件 QQ-Group:群号`
 
-  - 指定一个群进行同步（机器人账号应在目标群内）
-- `.同步全部`
+* `.同步文件 QQ-Group:群号`
+* 指定一个群进行同步（机器人账号应在目标群内）
 
-  - 同步 `config.toml` 中设置的所有群
-- `.展示页面`
 
-  - 强制重新生成展示页面
+* `.同步全部`
+* 同步 `config.toml` 中设置的所有群
+
+
+* `.展示页面`
+* 强制重新生成展示页面
+
+
+
+---
 
 ## 同步过程说明
 
@@ -91,6 +106,7 @@ uv run main.py watch
 需要创建: 0 个文件夹
 需要删除: 0 个文件 / 0 个文件夹 / 释放 0 B
 ================================
+
 ```
 
 展示页面默认输出到数据目录下的 `list.html`。
@@ -98,8 +114,10 @@ uv run main.py watch
 
 push 命令不会修改远端已有文件：
 
-- 仅对比“远端文件列表 vs 本地文件列表”
-- 只上传远端缺失的文件
+* 仅对比“远端文件列表 vs 本地文件列表”
+* 只上传远端缺失的文件
+
+---
 
 ## 配置示例
 
@@ -124,8 +142,55 @@ description = "介绍"
 title = "群文件导航"
 base_url = ""
 dashboard_file = "list.html"
+
 ```
+
+---
+
+## 构建
+
+* 默认（最快）：
+* `./build.sh`
+
+
+* release 模式（最大优化与压缩）：
+* `./build.sh --release`
+
+
+
+构建产物输出到 `dist/`，文件名形如 `qq-sync-linux-amd64` / `qq-sync-linux-arm64`。
+
+---
+
+## 项目结构
+
+* `main.py`：入口文件（把 `src/` 加到 `sys.path` 后启动 CLI）
+* `src/cli.py`：命令行入口（pull/push/watch）
+* `src/syncer.py`：拉取/同步逻辑
+* `src/pusher.py`：推送逻辑
+* `src/onebot.py`：OneBot WS 客户端封装
+* `src/dashboard.py`：展示页面生成
+* `src/templates/`：展示页面模板
+* `config.toml`：配置文件（首次运行自动生成示例）
+* `data/`：本地文件与生成页面的默认输出目录
+* `logs/`：日志目录
+
+---
 
 ## 其他
 
-- 小文件较多时可考虑并发下载（`--concurrency`参数）。
+* 小文件较多时可考虑并发下载（`--concurrency`参数）。
+
+---
+
+## 致谢
+
+### 本工具的诞生离不开这些优秀的前辈
+
+* [qq-group-files-sync](https://github.com/sealdice/qq-group-files-sync)
+* [LuckyLilliaBot](https://github.com/LLOneBot/LuckyLilliaBot)
+
+### 另外感谢这些给予我知识和鼓励的老师们
+
+* [Gemini](https://gemini.google.com)
+* [ChatGPT](https://chatgpt.com)

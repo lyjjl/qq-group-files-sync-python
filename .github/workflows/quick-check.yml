@@ -1,0 +1,69 @@
+name: quick-check
+
+on:
+  push:
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-24.04
+            ext: ""
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm64
+            ext: ""
+          - target: windows-amd64
+            runner: windows-latest
+            ext: ".exe"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install nuitka zstandard \
+            "typer>=0.12" \
+            "rich>=13.7" \
+            "pydantic>=2.6" \
+            "websockets>=12.0" \
+            "httpx>=0.27.0" \
+            "aiofiles>=23.2" \
+            "jinja2>=3.1"
+
+      - name: Build with Nuitka
+        shell: bash
+        run: |
+          OUTPUT_NAME="qq-sync-${{ matrix.target }}${{ matrix.ext }}"
+          python -m nuitka \
+            --onefile \
+            --follow-imports \
+            --lto=yes \
+            --onefile-compression-level=22 \
+            --output-dir=dist \
+            --output-filename="$OUTPUT_NAME" \
+            --include-data-dir=src/templates=templates \
+            --include-package-data=rich \
+            --include-package=rich._unicode_data \
+            --include-module=rich._unicode_data.unicode17-0-0 \
+            --include-package=websockets \
+            --include-module=websockets.asyncio \
+            --include-module=websockets.exceptions \
+            main.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qq-sync-${{ matrix.target }}
+          path: dist/qq-sync-${{ matrix.target }}${{ matrix.ext }}

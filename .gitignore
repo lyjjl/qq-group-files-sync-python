@@ -23,3 +23,10 @@ test_data/
 # Editor/IDE
 .idea/
 .vscode/
+
+# Build artifacts
+dist/
+build/
+.nuitka-cache/
+*.exe
+.tools/
