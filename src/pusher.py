@@ -97,6 +97,8 @@ class GroupFilePusher:
         group_root = group_root_dir(group_id_str)
 
         remote_files_all, remote_folders = await self._fetch_remote_tree(bot, group_id_num)
+        folder_path_to_id = {f.folder_path: f.folder_id for f in remote_folders.values()}
+        folder_path_to_id[""] = ""
 
         # ignore
         if self.ignore:
@@ -118,6 +120,42 @@ class GroupFilePusher:
         to_replace = sorted([k for k in (local_keys_non_empty & remote_keys) if int(local_size.get(k, -1)) != int(remote_files[k].file_size)])
         to_delete = sorted([k for k in (remote_keys - local_keys_protect)])
 
+        to_move: list[tuple[str, str, RemoteFile]] = []
+        if to_upload and to_delete:
+            missing_by_sig: dict[tuple[str, int], list[str]] = {}
+            for k in to_upload:
+                folder, name = self._split_key(k)
+                if "/" in folder and folder not in folder_path_to_id:
+                    continue
+                sig = (name, int(local_size.get(k, -1)))
+                missing_by_sig.setdefault(sig, []).append(k)
+
+            extra_by_sig: dict[tuple[str, int], list[RemoteFile]] = {}
+            for k in to_delete:
+                rf = remote_files.get(k)
+                if not rf:
+                    continue
+                sig = (rf.file_name, int(rf.file_size))
+                extra_by_sig.setdefault(sig, []).append(rf)
+
+            for sig, missing_keys in list(missing_by_sig.items()):
+                extras = extra_by_sig.get(sig)
+                if not extras:
+                    continue
+                while missing_keys and extras:
+                    dst_key = missing_keys.pop()
+                    rf = extras.pop()
+                    to_move.append((rf.folder_path, dst_key, rf))
+
+        if to_move:
+            moved_src = {(rf.folder_path, rf.file_name) for _, _, rf in to_move}
+            moved_dst = {dst_key for _, dst_key, _ in to_move}
+            to_upload = [k for k in to_upload if k not in moved_dst]
+            to_delete = [
+                k for k in to_delete
+                if (remote_files[k].folder_path, remote_files[k].file_name) not in moved_src
+            ]
+
         overview = Table(show_header=False, box=None)
         overview.add_column("项")
         overview.add_column("值", justify="right")
@@ -125,11 +163,19 @@ class GroupFilePusher:
         overview.add_row("本地文件", f"{len(local_keys_non_empty)}（空文件忽略 {len(local_empty)}）")
         overview.add_row("待上传", str(len(to_upload)))
         overview.add_row("待替换", str(len(to_replace)))
+        overview.add_row("可移动替代上传/删除", str(len(to_move)))
         overview.add_row("待删除远端多余", str(len(to_delete)))
         console.print(Panel(overview, title=f"镜像推送对比 {group_id_str}", expand=False))
 
         if plan:
-            self._print_plan(remote_folders, to_upload=to_upload, to_replace=to_replace, to_delete=to_delete, ignored_empty=local_empty)
+            self._print_plan(
+                remote_folders,
+                to_upload=to_upload,
+                to_replace=to_replace,
+                to_delete=to_delete,
+                to_move=[dst for _src, dst, _rf in to_move],
+                ignored_empty=local_empty,
+            )
             return
 
         if local_empty:
@@ -137,8 +183,6 @@ class GroupFilePusher:
             console.print(f"[yellow]WARN[/yellow]: 已忽略 {len(local_empty)} 个本地空文件(0B)，不会上传/替换，也不会触发远端删除。")
 
         # 确保顶级文件夹存在
-        folder_path_to_id = {f.folder_path: f.folder_id for f in remote_folders.values()}
-        folder_path_to_id[""] = ""
 
         semaphore = asyncio.Semaphore(self.concurrency)
         failures: list[str] = []
@@ -169,10 +213,10 @@ class GroupFilePusher:
             logging.getLogger(__name__).debug(
                 "upload_group_file: group=%s file=%s name=%s", group_id_str, abs_path, file_name
             )
-            res = await bot.call_api(
-                "upload_group_file",
-                {"group_id": group_id_num, "file": str(abs_path), "name": file_name},
-            )
+            payload = {"group_id": group_id_num, "file": str(abs_path), "name": file_name}
+            if target_folder_id:
+                payload["folder_id"] = target_folder_id
+            res = await bot.call_api("upload_group_file", payload)
             _require_ok("upload_group_file", res)
             data = res.data or {}
             file_id = str(data.get("file_id") or "").strip()
@@ -180,7 +224,7 @@ class GroupFilePusher:
                 raise RuntimeError("upload_group_file returned empty file_id")
 
             if target_folder_id:
-                await self._move_uploaded_file(bot, group_id_num, file_id, target_folder_id)
+                return
 
         async def handle_replace_or_upload(key: str, *, replace: bool) -> None:
             async with semaphore:
@@ -200,7 +244,19 @@ class GroupFilePusher:
                     logging.getLogger(__name__).exception("delete remote failed: group=%s key=%s", group_id_str, key)
                     failures.append(key)
 
+        async def move_remote(src_folder_path: str, dst_key: str, rf: RemoteFile) -> None:
+            async with semaphore:
+                try:
+                    folder_path, _file_name = self._split_key(dst_key)
+                    target_folder_id = await self._ensure_folder(bot, group_id_num, folder_path_to_id, folder_path)
+                    source_folder_id = folder_path_to_id.get(src_folder_path, "")
+                    await self._move_existing_file(bot, group_id_num, rf.file_id, source_folder_id, target_folder_id)
+                except Exception:
+                    logging.getLogger(__name__).exception("move remote failed: group=%s key=%s", group_id_str, dst_key)
+                    failures.append(dst_key)
+
         tasks = []
+        tasks += [asyncio.create_task(move_remote(src, dst, rf)) for src, dst, rf in to_move]
         tasks += [asyncio.create_task(handle_delete_only(k)) for k in to_delete]
         tasks += [asyncio.create_task(handle_replace_or_upload(k, replace=True)) for k in to_replace]
         tasks += [asyncio.create_task(handle_replace_or_upload(k, replace=False)) for k in to_upload]
@@ -282,23 +338,18 @@ class GroupFilePusher:
                     logging.getLogger(__name__).debug(
                         "upload_group_file: group=%s file=%s name=%s", group_id_str, abs_path, file_name
                     )
-                    res = await bot.call_api(
-                        "upload_group_file",
-                        {
-                            "group_id": group_id_num,
-                            "file": str(abs_path),
-                            "name": file_name,
-                        },
-                    )
+                    payload = {"group_id": group_id_num, "file": str(abs_path), "name": file_name}
+                    if target_folder_id:
+                        payload["folder_id"] = target_folder_id
+                    res = await bot.call_api("upload_group_file", payload)
                     _require_ok("upload_group_file", res)
                     data = res.data or {}
                     file_id = str(data.get("file_id") or "").strip()
                     if not file_id:
                         raise RuntimeError("upload_group_file returned empty file_id")
 
-                    # 移动到对应的文件夹
                     if target_folder_id:
-                        await self._move_uploaded_file(bot, group_id_num, file_id, target_folder_id)
+                        return
 
                 except Exception:
                     logging.getLogger(__name__).exception("push failed: group=%s file=%s", group_id_str, rel_key)
@@ -376,6 +427,7 @@ class GroupFilePusher:
         to_upload: list[str],
         to_replace: list[str],
         to_delete: list[str],
+        to_move: list[str] | None = None,
         ignored_empty: list[str] | None = None,
     ) -> None:
         """当存在 --plan 参数时，打印预计执行的操作。"""
@@ -395,18 +447,21 @@ class GroupFilePusher:
         summary.add_column("数量", justify="left")
         summary.add_column("说明")
 
+        summary_rows = 0
+
         def add_row(action: str, n: int, note: str) -> None:
             if n:
                 summary.add_row(action, str(n), note)
+                nonlocal summary_rows
+                summary_rows += 1
 
         add_row("忽略本地空文件", len(ignored_empty or []), "0B：自动忽略")
         add_row("创建远端一级文件夹", len(folders_to_create), "仅支持一级")
         add_row("缺失嵌套文件夹", len(blocked_nested), "需手动创建")
         add_row("删除远端多余文件", len(to_delete), "仅镜像模式")
+        add_row("移动远端文件", len(to_move or []), "替代上传/删除")
         add_row("替换远端不同文件", len(to_replace), "删除后上传")
         add_row("上传远端缺失文件", len(to_upload), "仅缺失项")
-
-        console.print(Panel(summary, title="操作计划", expand=False))
 
         rows: list[tuple[str, str, str]] = []
 
@@ -428,10 +483,14 @@ class GroupFilePusher:
         for it in to_upload:
             rows.append(("UPLOAD", it, "上传缺失"))
 
+        if summary_rows == 0 and not rows:
+            console.print(Panel("没有需要进行的操作。", title="操作计划", expand=False))
+            return
+
+        console.print(Panel(summary, title="操作计划", expand=False))
         if rows:
             self._print_plan_table(rows, title="计划明细", limit=200)
 
-        console.print("[dim]注：上传到子文件夹会先上传到根目录，再 move 进目标文件夹；不会删除远端文件夹（即使为空）。[/dim]")
 
     def _print_plan_table(self, rows: list[tuple[str, str, str]], *, title: str, limit: int = 200) -> None:
         style_map: dict[str, str] = {
@@ -440,6 +499,7 @@ class GroupFilePusher:
             "BLOCKED": "yellow",
             "DELETE_REMOTE": "red",
             "REPLACE_REMOTE": "magenta",
+            "MOVE_REMOTE": "cyan",
             "UPLOAD": "green",
         }
 
@@ -517,3 +577,29 @@ class GroupFilePusher:
             if getattr(res, "retcode", -1) == 0:
                 return
         _require_ok("move_group_file", res)
+
+    async def _move_existing_file(
+        self,
+        bot: OneBotWsClient,
+        group_id_num: int,
+        file_id: str,
+        source_folder_id: str,
+        target_folder_id: str,
+    ) -> None:
+        parents = [source_folder_id] if source_folder_id else []
+        parents += ["", "/"]
+        for parent in parents:
+            res = await bot.call_api(
+                "move_group_file",
+                {
+                    "group_id": group_id_num,
+                    "file_id": file_id,
+                    "parent_directory": parent,
+                    "target_directory": target_folder_id,
+                },
+            )
+            if getattr(res, "retcode", -1) == 0:
+                return
+        _require_ok("move_group_file", res)
+        for it in sorted(to_move or []):
+            rows.append(("MOVE_REMOTE", it, "移动到目标路径"))
