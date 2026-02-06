@@ -23,19 +23,7 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100")"
           export RESP="$resp"
-          should_cancel="$(python - <<'PY'
-import json, os
-data = json.loads(os.environ["RESP"])
-jobs = data.get("jobs", [])
-build_jobs = [j for j in jobs if str(j.get("name", "")).startswith("build (")]
-if not build_jobs:
-    print("0")
-    raise SystemExit(0)
-statuses = [j.get("status") for j in build_jobs]
-# Only cancel if ALL build jobs are still queued (i.e., none started).
-print("1" if all(s == "queued" for s in statuses) else "0")
-PY
-)"
+          should_cancel="$(python -c 'import json,os; data=json.loads(os.environ["RESP"]); jobs=data.get("jobs", []); build_jobs=[j for j in jobs if str(j.get("name","")).startswith("build (")]; print("1" if build_jobs and all(j.get("status")=="queued" for j in build_jobs) else "0")')"
           if [[ "$should_cancel" == "1" ]]; then
             curl -sS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
