@@ -12,6 +12,7 @@
 * [构建方法](#构建)
 * [其他](#其他)
 * [致谢](#致谢)
+* [赛博要饭](#赛博要饭)
 
 ---
 
@@ -181,3 +182,13 @@ dashboard_file = "list.html"
 
 * [Gemini](https://gemini.google.com)
 * [ChatGPT](https://chatgpt.com)
+
+---
+
+## 赛博要饭
+
+### 小女子要吃不起饭了，现在每天靠方便面度日，各位如果觉得项目对你有帮助且有余力的话，帮帮咱喵
+
+#### ~~补药期待着等咱下海了再来支持哇~~
+
+<img src="https://github.com/user-attachments/assets/c42d06de-3014-4b60-af57-8d26f97a8843" width="20%" alt="饭碗">
