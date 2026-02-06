@@ -10,7 +10,6 @@
 * [同步过程说明](#同步过程说明)
 * [配置示例](#配置示例)
 * [构建方法](#构建)
-* [项目结构](#目录)
 * [其他](#其他)
 * [致谢](#致谢)
 
@@ -72,6 +71,9 @@ uv run main.py watch
 ---
 
 ## 交互模式指令
+
+> ~~其实更推荐你用cli来着~~
+> ~~交互式什么的，咕咕咕~~
 
 在群内发送：
 
@@ -159,21 +161,6 @@ dashboard_file = "list.html"
 
 
 构建产物输出到 `dist/`，文件名形如 `qq-sync-linux-amd64` / `qq-sync-linux-arm64`。
-
----
-
-## 项目结构
-
-* `main.py`：入口文件（把 `src/` 加到 `sys.path` 后启动 CLI）
-* `src/cli.py`：命令行入口（pull/push/watch）
-* `src/syncer.py`：拉取/同步逻辑
-* `src/pusher.py`：推送逻辑
-* `src/onebot.py`：OneBot WS 客户端封装
-* `src/dashboard.py`：展示页面生成
-* `src/templates/`：展示页面模板
-* `config.toml`：配置文件（首次运行自动生成示例）
-* `data/`：本地文件与生成页面的默认输出目录
-* `logs/`：日志目录
 
 ---
 
