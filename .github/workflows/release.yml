@@ -98,11 +98,6 @@ jobs:
         with:
           path: dist
 
-      - name: Prepare source archive
-        shell: bash
-        run: |
-          git archive --format=zip --output source-code.zip HEAD
-
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -111,4 +106,3 @@ jobs:
           body: ${{ inputs.release_notes }}
           files: |
             dist/**/qq-sync-*
-            source-code.zip
