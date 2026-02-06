@@ -3,7 +3,47 @@ name: quick-check
 on:
   push:
 
+permissions:
+  actions: write
+
 jobs:
+  queue-timeout:
+    name: queue-timeout
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Cancel if still queued after 10 minutes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          sleep 600
+          resp="$(curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100")"
+          export RESP="$resp"
+          should_cancel="$(python - <<'PY'
+import json, os
+data = json.loads(os.environ["RESP"])
+jobs = data.get("jobs", [])
+build_jobs = [j for j in jobs if str(j.get("name", "")).startswith("build (")]
+if not build_jobs:
+    print("0")
+    raise SystemExit(0)
+statuses = [j.get("status") for j in build_jobs]
+# Only cancel if ALL build jobs are still queued (i.e., none started).
+print("1" if all(s == "queued" for s in statuses) else "0")
+PY
+)"
+          if [[ "$should_cancel" == "1" ]]; then
+            curl -sS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null
+            echo "Cancelled run $RUN_ID due to 10m queue timeout."
+          else
+            echo "Build already started; no cancel."
+          fi
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -44,6 +84,8 @@ jobs:
 
       - name: Build with Nuitka
         shell: bash
+        env:
+          NUITKA_ASSUME_YES_FOR_DOWNLOADS: "1"
         run: |
           OUTPUT_NAME="qq-sync-${{ matrix.target }}${{ matrix.ext }}"
           python -m nuitka \
