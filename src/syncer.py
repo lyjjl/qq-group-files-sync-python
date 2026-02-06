@@ -682,7 +682,16 @@ class GroupFileSyncer:
                         tmp_suffix = sanitize_component(str(f.file_id).strip("/") or "file")[:16]
                         tmp = target.with_name(f"{target.name}.part.{tmp_suffix}")
 
+                        logging.getLogger(__name__).debug("download request: %s", url)
+                        start_ts = time.monotonic()
+                        total_bytes = 0
                         async with client.stream("GET", url) as resp:
+                            logging.getLogger(__name__).debug(
+                                "download response: url=%s status=%s headers=%s",
+                                url,
+                                resp.status_code,
+                                dict(resp.headers),
+                            )
                             if resp.status_code in {403, 404, 410}:
                                 logging.getLogger(__name__).debug(
                                     "group file invalid (http %s), skipped: group=%s path=%s full_rel=%s",
@@ -700,7 +709,15 @@ class GroupFileSyncer:
                             resp.raise_for_status()
                             async with aiofiles.open(tmp, "wb") as af:
                                 async for chunk in resp.aiter_bytes():
+                                    total_bytes += len(chunk)
                                     await af.write(chunk)
+                        elapsed_ms = int((time.monotonic() - start_ts) * 1000)
+                        logging.getLogger(__name__).debug(
+                            "download complete: url=%s bytes=%s elapsed_ms=%s",
+                            url,
+                            total_bytes,
+                            elapsed_ms,
+                        )
 
                         if target.exists() and target.is_dir():
                             if mirror:

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, Optional
 
 import inspect
+import logging
 
 import websockets
 
@@ -104,6 +105,7 @@ class OneBotWsClient:
         self._pending[echo] = fut
 
         req: dict[str, Any] = {"action": action, "params": params or {}, "echo": echo}
+        logging.getLogger(__name__).debug("onebot request: %s", req)
         await self._ws.send(json.dumps(req, ensure_ascii=False))
 
         try:
@@ -111,6 +113,7 @@ class OneBotWsClient:
         except Exception:
             self._pending.pop(echo, None)
             raise
+        logging.getLogger(__name__).debug("onebot response: %s", raw)
         return ActionResult(
             status=str(raw.get("status", "")),
             retcode=int(raw.get("retcode", -1)),
