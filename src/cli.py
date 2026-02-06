@@ -340,6 +340,43 @@ def _ensure_unique_group_ids(cfg) -> None:
         raise typer.Exit(code=2)
 
 
+def _load_cfg_and_logging(config_path: str):
+    cfg = load_config(config_path)
+    _ensure_unique_group_ids(cfg)
+    console_level = _setup_logging(cfg.log_file, cfg.log_level)
+    return cfg, console_level
+
+
+def _build_fs_and_ignore(cfg, ignore_file: str | None) -> tuple[FileSystemManager, IgnoreMatcher | None]:
+    fs = FileSystemManager(cfg.file_system.local_path)
+    ignore = _load_ignore_matcher(ignore_file)
+    return fs, ignore
+
+
+def _run_with_ws(console_level: int, cfg, runner) -> None:
+    try:
+        asyncio.run(runner())
+    except (
+        ConnectionRefusedError,
+        OSError,
+        websockets.InvalidURI,
+        websockets.InvalidHandshake,
+    ) as e:
+        if console_level <= logging.DEBUG:
+            logging.getLogger(__name__).exception("failed to connect onebot ws")
+            raise
+        logging.getLogger(__name__).error("failed to connect onebot ws: %s", e)
+        _connect_hint(cfg)
+        raise typer.Exit(code=2)
+    except Exception as e:
+        logging.getLogger(__name__).exception("unhandled error")
+        if console_level <= logging.DEBUG:
+            raise
+        console.print(f"运行失败：{e}")
+        console.print("将 logLevel 调为 debug 可查看更详细堆栈。")
+        raise typer.Exit(code=1)
+
+
 @app.command(help="拉取群文件（增量备份）")
 def pull(
     target: str = typer.Argument(..., help="all 或群号：QQ-Group:123456 / 纯数字"),
@@ -350,12 +387,8 @@ def pull(
     plan: bool = typer.Option(False, "--plan", help="只对比并输出将执行的操作，不做任何修改"),
     ignore_file: str | None = typer.Option(None, "--ignore-file", help="忽略规则文件路径（相对路径）。默认读取 ./.ignore（如存在）"),
 ) -> None:
-    cfg = load_config(config)
-    _ensure_unique_group_ids(cfg)
-    console_level = _setup_logging(cfg.log_file, cfg.log_level)
-
-    fs = FileSystemManager(cfg.file_system.local_path)
-    ignore = _load_ignore_matcher(ignore_file)
+    cfg, console_level = _load_cfg_and_logging(config)
+    fs, ignore = _build_fs_and_ignore(cfg, ignore_file)
 
     pull_all = (target or "").strip().lower() == "all"
 
@@ -406,27 +439,7 @@ def pull(
                 body += "\n展示页面：已生成/更新"
             console.print(Panel(body, title=title, expand=False))
 
-    try:
-        asyncio.run(runner())
-    except (
-        ConnectionRefusedError,
-        OSError,
-        websockets.InvalidURI,
-        websockets.InvalidHandshake,
-    ) as e:
-        if console_level <= logging.DEBUG:
-            logging.getLogger(__name__).exception("failed to connect onebot ws")
-            raise
-        logging.getLogger(__name__).error("failed to connect onebot ws: %s", e)
-        _connect_hint(cfg)
-        raise typer.Exit(code=2)
-    except Exception as e:
-        logging.getLogger(__name__).exception("unhandled error")
-        if console_level <= logging.DEBUG:
-            raise
-        console.print(f"运行失败：{e}")
-        console.print("将 logLevel 调为 debug 可查看更详细堆栈。")
-        raise typer.Exit(code=1)
+    _run_with_ws(console_level, cfg, runner)
 
 
 @app.command(help="推送本地文件到群文件（仅补齐远端缺失）")
@@ -438,12 +451,8 @@ def push(
     plan: bool = typer.Option(False, "--plan", help="只对比并输出将执行的操作，不做任何修改"),
     ignore_file: str | None = typer.Option(None, "--ignore-file", help="忽略规则文件路径（相对路径）。默认读取 ./.ignore（如存在）"),
 ) -> None:
-    cfg = load_config(config)
-    _ensure_unique_group_ids(cfg)
-    console_level = _setup_logging(cfg.log_file, cfg.log_level)
-
-    fs = FileSystemManager(cfg.file_system.local_path)
-    ignore = _load_ignore_matcher(ignore_file)
+    cfg, console_level = _load_cfg_and_logging(config)
+    fs, ignore = _build_fs_and_ignore(cfg, ignore_file)
     push_all = (target or "").strip().lower() == "all"
 
     if push_all and is_placeholder_config(cfg):
@@ -496,27 +505,7 @@ def push(
             body = f"{gid_str}\n本地数据目录: {fs.base_path}"
             console.print(Panel(body, title=title, expand=False))
 
-    try:
-        asyncio.run(runner())
-    except (
-        ConnectionRefusedError,
-        OSError,
-        websockets.InvalidURI,
-        websockets.InvalidHandshake,
-    ) as e:
-        if console_level <= logging.DEBUG:
-            logging.getLogger(__name__).exception("failed to connect onebot ws")
-            raise
-        logging.getLogger(__name__).error("failed to connect onebot ws: %s", e)
-        _connect_hint(cfg)
-        raise typer.Exit(code=2)
-    except Exception as e:
-        logging.getLogger(__name__).exception("unhandled error")
-        if console_level <= logging.DEBUG:
-            raise
-        console.print(f"运行失败：{e}")
-        console.print("将 logLevel 调为 debug 可查看更详细堆栈。")
-        raise typer.Exit(code=1)
+    _run_with_ws(console_level, cfg, runner)
 
 
 @app.command(help="进入交互等待模式（可在群里发指令触发同步）")
@@ -525,12 +514,8 @@ def watch(
     concurrency: int = typer.Option(4, "--concurrency", min=1, max=32, help="并发下载数"),
     ignore_file: str | None = typer.Option(None, "--ignore-file", help="忽略规则文件路径（相对路径）。默认读取 ./.ignore（如存在）"),
 ) -> None:
-    cfg = load_config(config)
-    _ensure_unique_group_ids(cfg)
-    console_level = _setup_logging(cfg.log_file, cfg.log_level)
-
-    fs = FileSystemManager(cfg.file_system.local_path)
-    ignore = _load_ignore_matcher(ignore_file)
+    cfg, console_level = _load_cfg_and_logging(config)
+    fs, ignore = _build_fs_and_ignore(cfg, ignore_file)
 
     if is_placeholder_config(cfg):
         logging.getLogger(__name__).warning("refuse to run: placeholder config")
@@ -543,27 +528,7 @@ def watch(
             syncer = GroupFileSyncer(cfg, fs, concurrency=concurrency, ignore=ignore)
             await _interactive(cfg, fs, bot, syncer)
 
-    try:
-        asyncio.run(runner())
-    except (
-        ConnectionRefusedError,
-        OSError,
-        websockets.InvalidURI,
-        websockets.InvalidHandshake,
-    ) as e:
-        if console_level <= logging.DEBUG:
-            logging.getLogger(__name__).exception("failed to connect onebot ws")
-            raise
-        logging.getLogger(__name__).error("failed to connect onebot ws: %s", e)
-        _connect_hint(cfg)
-        raise typer.Exit(code=2)
-    except Exception as e:
-        logging.getLogger(__name__).exception("unhandled error")
-        if console_level <= logging.DEBUG:
-            raise
-        console.print(f"运行失败：{e}")
-        console.print("将 logLevel 调为 debug 可查看更详细堆栈。")
-        raise typer.Exit(code=1)
+    _run_with_ws(console_level, cfg, runner)
 
 
 if __name__ == "__main__":

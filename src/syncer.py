@@ -31,6 +31,7 @@ from group_paths import (
 )
 from onebot import OneBotWsClient, parse_group_numeric_id
 from ignore_rules import IgnoreMatcher
+from local_files import list_group_files, list_group_files_rel
 
 console = Console()
 
@@ -258,31 +259,25 @@ class GroupFileSyncer:
 
         group_root = group_root_dir(group_id_str)
 
-        existing_files_list = self.fs.list_files_under(group_root)
+        existing_rel_files = list_group_files(self.fs, group_root)
         existing_set: set[str] = set()
         existing_size_map: dict[str, int] = {}
         empty_local_full: set[str] = set()
         ignored_empty_local: list[str] = []
-
         root_prefix = f"{group_root}/".replace("\\", "/")
-        for pth in existing_files_list:
-            ps = str(pth).replace("\\", "/")
-            if not ps.startswith(root_prefix):
-                continue
-            rel = ps[len(root_prefix):]
+        for rel in existing_rel_files:
             if self.ignore and self.ignore.is_ignored(rel):
                 continue
-            existing_set.add(ps)
+            full_rel = f"{group_root}/{rel}".replace("\\", "/")
+            existing_set.add(full_rel)
             try:
-                sz = int((self.fs.base_path / Path(ps)).stat().st_size)
-                existing_size_map[ps] = sz
+                sz = int(self.fs.resolve(full_rel).stat().st_size)
+                existing_size_map[full_rel] = sz
                 if sz == 0:
-                    empty_local_full.add(ps)
-
-                    if ps.startswith(root_prefix):
-                        ignored_empty_local.append(ps[len(root_prefix):])
+                    empty_local_full.add(full_rel)
+                    ignored_empty_local.append(rel)
             except Exception:
-                existing_size_map[ps] = 0
+                existing_size_map[full_rel] = 0
 
         update_map: dict[str, GroupFileInfo] = {}
 
@@ -484,7 +479,7 @@ class GroupFileSyncer:
                 name = str(f.get("file_name") or "")
                 expected_files.add(group_relative_file_path(folder_path, name))
 
-            local_kept, local_ignored = self._list_local_files_rel(group_root)
+            local_kept, local_ignored = list_group_files_rel(self.fs, group_root, self.ignore)
             kept_files = set(expected_files) | set(local_ignored) | set(getattr(p, "ignored_empty_local", []) or [])
 
             keep_dirs: set[str] = set()
@@ -509,9 +504,13 @@ class GroupFileSyncer:
         summary.add_column("数量", width=detail_width)
         summary.add_column("说明", width=note_width)
 
+        summary_rows = 0
+
         def add_summary(action: str, n: int, note: str) -> None:
             if n:
+                nonlocal summary_rows
                 summary.add_row(action, str(n), note)
+                summary_rows += 1
 
         add_summary("忽略空文件", len(getattr(p, "ignored_empty_remote", []) or []), "0B：不会下载/替换")
         add_summary("保留空文件", len(getattr(p, "ignored_empty_local", []) or []), "0B：不参与删除")
@@ -519,7 +518,7 @@ class GroupFileSyncer:
         add_summary("替换文件", len(replace_files), "删除后下载")
         add_summary("下载缺失", len(download_files), "仅缺失项")
         add_summary("删除多余", len(extra_files), "仅镜像模式")
-        add_summary("清理空文件夹", len(dirs_to_delete), "推测")
+        add_summary("清理空文件夹", len(dirs_to_delete), "推测（以实际清理为准）")
 
         details = Table(show_header=True, header_style="bold", box=None)
         details.add_column("动作", width=action_width, no_wrap=True)
@@ -545,6 +544,10 @@ class GroupFileSyncer:
         for it in dirs_to_delete:
             rows.append(("RMDIR", it, "镜像：清理空文件夹(推测)"))
 
+        if summary_rows == 0 and not rows:
+            console.print(Panel("没有需要进行的操作。", title="操作计划", expand=False))
+            return
+
         style_map: dict[str, str] = {
             "IGNORE_EMPTY_REMOTE": "yellow",
             "IGNORE_EMPTY_LOCAL": "yellow",
@@ -562,38 +565,6 @@ class GroupFileSyncer:
 
         divider = Text("─" * (action_width + detail_width + note_width + 6), style="dim")
         console.print(Panel(Group(summary, divider, details), title="操作计划", expand=False))
-
-
-    def _build_plan_table(self, rows: list[tuple[str, str, str]], *, limit: int = 200) -> Table:
-        table = Table(show_header=True, header_style="bold", box=None)
-        table.add_column("动作", no_wrap=True)
-        table.add_column("路径")
-        table.add_column("说明")
-        show = rows[:limit]
-        for action, path, note in show:
-            table.add_row(action, path, note)
-        if len(rows) > limit:
-            table.add_row("...", f"...（已截断，剩余 {len(rows) - limit} 项）", "")
-        return table
-
-    def _list_local_files_rel(self, group_root: str) -> tuple[set[str], set[str]]:
-
-        kept: set[str] = set()
-        ignored: set[str] = set()
-
-        root_prefix = f"{group_root}/".replace("\\", "/")
-        for p in self.fs.list_files_under(group_root):
-            ps = str(p).replace("\\", "/")
-            if not ps.startswith(root_prefix):
-                continue
-            rel = ps[len(root_prefix) :]
-            if not rel:
-                continue
-            if self.ignore and self.ignore.is_ignored(rel):
-                ignored.add(rel)
-            else:
-                kept.add(rel)
-        return kept, ignored
 
     def _list_local_dirs_rel(self, group_root: str) -> list[str]:
         root = self.fs.base_path / Path(group_root)
@@ -635,7 +606,8 @@ class GroupFileSyncer:
         semaphore = asyncio.Semaphore(self.concurrency)
         ts_map = self._timestamp_cache.setdefault(group_id_str, {})
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(60.0)) as client:
+        limits = httpx.Limits(max_connections=self.concurrency, max_keepalive_connections=self.concurrency)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(60.0), limits=limits) as client:
 
             async def download_one(full_rel: str, f: GroupFileInfo) -> None:
                 async with semaphore:
@@ -784,22 +756,17 @@ class GroupFileSyncer:
             rel = group_relative_file_path(folder_path, str(f.get("file_name") or ""))
             expected.add(f"{group_root}/{rel}".replace("\\", "/"))
 
-        existing_full = self.fs.list_files_under(group_root)
         existing: set[str] = set()
-        root_prefix = f"{group_root}/".replace("\\", "/")
-        for p in existing_full:
-            ps = str(p).replace("\\", "/")
-            if not ps.startswith(root_prefix):
-                continue
-            rel = ps[len(root_prefix) :]
+        for rel in list_group_files(self.fs, group_root):
             if self.ignore and self.ignore.is_ignored(rel):
                 continue
+            full_rel = f"{group_root}/{rel}".replace("\\", "/")
             try:
-                if (self.fs.base_path / Path(ps)).stat().st_size == 0:
+                if self.fs.resolve(full_rel).stat().st_size == 0:
                     continue
             except Exception:
                 pass
-            existing.add(ps)
+            existing.add(full_rel)
 
         extra = [p for p in existing if p not in expected]
         for p in extra:

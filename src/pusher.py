@@ -14,6 +14,7 @@ from filesystem import FileSystemManager
 from group_paths import group_root_dir, sanitize_component
 from onebot import OneBotWsClient, parse_group_numeric_id
 from ignore_rules import IgnoreMatcher
+from local_files import filter_ignored, list_group_files, split_files_by_size
 
 console = Console()
 
@@ -105,10 +106,10 @@ class GroupFilePusher:
 
         remote_keys = set(remote_files.keys())
 
-        local_rel_files_all = self._list_local_files_under_group(group_root)
-        local_rel_files = [p for p in local_rel_files_all if not (self.ignore and self.ignore.is_ignored(p))]
+        local_rel_files_all = list_group_files(self.fs, group_root)
+        local_rel_files = filter_ignored(local_rel_files_all, self.ignore)
 
-        local_non_empty, local_empty, local_size = self._split_local_files_by_size(group_root, local_rel_files)
+        local_non_empty, local_empty, local_size = split_files_by_size(self.fs, group_root, local_rel_files)
         # 注意：上传/替换时会忽略空文件（因为群文件没法上传空文件），但在 --mirror 模式下，它们也会使远程路径不被删除，有点奇怪哈
         local_keys_non_empty = set(local_non_empty)
         local_keys_protect = local_keys_non_empty | set(local_empty)
@@ -231,10 +232,10 @@ class GroupFilePusher:
         remote_files, remote_folders = await self._fetch_remote_tree(bot, group_id_num)
         remote_file_paths = {self._remote_path_key(f.folder_path, f.file_name) for f in remote_files.values()}
 
-        local_rel_files_all = self._list_local_files_under_group(group_root)
-        local_rel_files = [p for p in local_rel_files_all if not (self.ignore and self.ignore.is_ignored(p))]
+        local_rel_files_all = list_group_files(self.fs, group_root)
+        local_rel_files = filter_ignored(local_rel_files_all, self.ignore)
 
-        local_non_empty, local_empty_all, _size_map = self._split_local_files_by_size(group_root, local_rel_files)
+        local_non_empty, local_empty_all, _size_map = split_files_by_size(self.fs, group_root, local_rel_files)
         # only consider non-empty files for upload; empty files are ignored
         missing_local = [p for p in local_non_empty if p not in remote_file_paths]
         ignored_empty = [p for p in local_empty_all if p not in remote_file_paths]
@@ -368,50 +369,6 @@ class GroupFilePusher:
         await fetch("", "")
         return files, folders
 
-    def _split_local_files_by_size(self, group_root: str, rel_files: list[str]) -> tuple[list[str], list[str], dict[str, int]]:
-        """将群组目录下的本地文件转化为 non_empty, empty, size_map
-
-        - empty: 大小为 0 的文件
-        - size_map: 仅包含非空文件；若 stat（获取文件状态）失败，则大小记录为 -1
-        """
-
-        non_empty: list[str] = []
-        empty: list[str] = []
-        size_map: dict[str, int] = {}
-        for k in rel_files:
-            try:
-                abs_path = self.fs.resolve(f"{group_root}/{k}").resolve()
-                sz = int(abs_path.stat().st_size)
-                if sz == 0:
-                    empty.append(k)
-                else:
-                    non_empty.append(k)
-                    size_map[k] = sz
-            except Exception:
-                # keep it in non-empty so failures are surfaced during upload
-                non_empty.append(k)
-                size_map[k] = -1
-        non_empty.sort()
-        empty.sort()
-        return non_empty, empty, size_map
-
-    def _list_local_files_under_group(self, group_root: str) -> list[str]:
-        """返回相对于根目录的本地文件路径，例如 "a/b/file.ext" """
-
-        full = self.fs.list_files_under(group_root)
-        out: list[str] = []
-        root_prefix = f"{PurePosixPath(group_root).as_posix().rstrip('/')}/"
-        for p in full:
-            pp = PurePosixPath(p)
-            ps = pp.as_posix()
-            if not ps.startswith(root_prefix):
-                continue
-            rel = ps[len(root_prefix) :]
-            if rel:
-                out.append(rel)
-        out.sort()
-        return out
-
     def _print_plan(
         self,
         remote_folders: dict[str, RemoteFolder],
@@ -435,7 +392,7 @@ class GroupFilePusher:
 
         summary = Table(show_header=True, header_style="bold", box=None)
         summary.add_column("动作")
-        summary.add_column("数量", justify="right")
+        summary.add_column("数量", justify="left")
         summary.add_column("说明")
 
         def add_row(action: str, n: int, note: str) -> None:

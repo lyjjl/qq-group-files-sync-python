@@ -80,21 +80,30 @@ class OneBotWsClient:
 
     async def _recv_loop(self) -> None:
         assert self._ws is not None
-        async for msg in self._ws:
-            try:
-                payload = json.loads(msg)
-            except Exception:
-                continue
+        try:
+            async for msg in self._ws:
+                try:
+                    payload = json.loads(msg)
+                except Exception:
+                    continue
 
-            if isinstance(payload, dict) and "echo" in payload:
-                echo = str(payload.get("echo"))
-                fut = self._pending.pop(echo, None)
-                if fut is not None and not fut.done():
-                    fut.set_result(payload)
-                continue
+                if isinstance(payload, dict) and "echo" in payload:
+                    echo = str(payload.get("echo"))
+                    fut = self._pending.pop(echo, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(payload)
+                    continue
 
-            if isinstance(payload, dict):
-                await self._events.put(payload)
+                if isinstance(payload, dict):
+                    await self._events.put(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger(__name__).exception("websocket recv loop ended unexpectedly")
+        finally:
+            for fut in list(self._pending.values()):
+                if not fut.done():
+                    fut.set_exception(RuntimeError("websocket recv loop ended"))
 
     async def call_api(self, action: str, params: Optional[dict[str, Any]] = None) -> ActionResult:
         if self._ws is None:
@@ -106,7 +115,11 @@ class OneBotWsClient:
 
         req: dict[str, Any] = {"action": action, "params": params or {}, "echo": echo}
         logging.getLogger(__name__).debug("onebot request: %s", req)
-        await self._ws.send(json.dumps(req, ensure_ascii=False))
+        try:
+            await self._ws.send(json.dumps(req, ensure_ascii=False))
+        except Exception:
+            self._pending.pop(echo, None)
+            raise
 
         try:
             raw = await asyncio.wait_for(fut, timeout=self.request_timeout_s)
