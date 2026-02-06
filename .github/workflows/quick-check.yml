@@ -3,35 +3,7 @@ name: quick-check
 on:
   push:
 
-permissions:
-  actions: write
-
 jobs:
-  queue-timeout:
-    name: queue-timeout
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Cancel if still queued after 10 minutes
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_ID: ${{ github.run_id }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          sleep 600
-          resp="$(curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100")"
-          export RESP="$resp"
-          should_cancel="$(python -c 'import json,os; data=json.loads(os.environ["RESP"]); jobs=data.get("jobs", []); build_jobs=[j for j in jobs if str(j.get("name","")).startswith("build (")]; print("1" if build_jobs and all(j.get("status")=="queued" for j in build_jobs) else "0")')"
-          if [[ "$should_cancel" == "1" ]]; then
-            curl -sS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null
-            echo "Cancelled run $RUN_ID due to 10m queue timeout."
-          else
-            echo "Build already started; no cancel."
-          fi
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -41,9 +13,6 @@ jobs:
         include:
           - target: linux-amd64
             runner: ubuntu-24.04
-            ext: ""
-          - target: linux-arm64
-            runner: ubuntu-24.04-arm64
             ext: ""
           - target: windows-amd64
             runner: windows-latest
@@ -80,6 +49,7 @@ jobs:
             --onefile \
             --follow-imports \
             --lto=yes \
+            --assume-yes-for-downloads \
             --output-dir=dist \
             --output-filename="$OUTPUT_NAME" \
             --include-data-dir=src/templates=templates \
