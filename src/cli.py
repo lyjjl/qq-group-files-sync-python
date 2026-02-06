@@ -13,7 +13,7 @@ from rich.panel import Panel
 
 import websockets
 
-from config import load_config, is_placeholder_config
+from config import load_config, is_placeholder_config, find_duplicate_group_ids
 from dashboard import generate_dashboard
 from filesystem import FileSystemManager
 from onebot import OneBotWsClient, extract_plain_text, parse_group_numeric_id
@@ -329,6 +329,17 @@ def _load_ignore_matcher(ignore_file: str | None) -> IgnoreMatcher | None:
     return None
 
 
+def _ensure_unique_group_ids(cfg) -> None:
+    dupes = find_duplicate_group_ids(cfg)
+    if dupes:
+        console.print("[red]配置错误：groups 中存在重复的 id[/red]")
+        console.print("请修改 config.toml，确保每个 [[groups]] 的 id 唯一。")
+        console.print("重复的 id：")
+        for gid in dupes:
+            console.print(f"- {gid}")
+        raise typer.Exit(code=2)
+
+
 @app.command(help="拉取群文件（增量备份）")
 def pull(
     target: str = typer.Argument(..., help="all 或群号：QQ-Group:123456 / 纯数字"),
@@ -340,6 +351,7 @@ def pull(
     ignore_file: str | None = typer.Option(None, "--ignore-file", help="忽略规则文件路径（相对路径）。默认读取 ./.ignore（如存在）"),
 ) -> None:
     cfg = load_config(config)
+    _ensure_unique_group_ids(cfg)
     console_level = _setup_logging(cfg.log_file, cfg.log_level)
 
     fs = FileSystemManager(cfg.file_system.local_path)
@@ -427,6 +439,7 @@ def push(
     ignore_file: str | None = typer.Option(None, "--ignore-file", help="忽略规则文件路径（相对路径）。默认读取 ./.ignore（如存在）"),
 ) -> None:
     cfg = load_config(config)
+    _ensure_unique_group_ids(cfg)
     console_level = _setup_logging(cfg.log_file, cfg.log_level)
 
     fs = FileSystemManager(cfg.file_system.local_path)
@@ -513,6 +526,7 @@ def watch(
     ignore_file: str | None = typer.Option(None, "--ignore-file", help="忽略规则文件路径（相对路径）。默认读取 ./.ignore（如存在）"),
 ) -> None:
     cfg = load_config(config)
+    _ensure_unique_group_ids(cfg)
     console_level = _setup_logging(cfg.log_file, cfg.log_level)
 
     fs = FileSystemManager(cfg.file_system.local_path)

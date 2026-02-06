@@ -147,6 +147,19 @@ def load_config(path: str | Path = "config.toml") -> AppConfig:
     return cfg
 
 
+def find_duplicate_group_ids(cfg: AppConfig) -> list[str]:
+    seen: set[str] = set()
+    dupes: list[str] = []
+    for g in cfg.groups:
+        gid = (g.id or "").strip()
+        if not gid:
+            continue
+        if gid in seen and gid not in dupes:
+            dupes.append(gid)
+        seen.add(gid)
+    return dupes
+
+
 def _toml_quote(text: str) -> str:
     s = str(text or "")
     s = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
