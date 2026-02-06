@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import aiofiles
 import httpx
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -500,24 +500,31 @@ class GroupFileSyncer:
                 dirs_to_delete.append(d)
             dirs_to_delete.sort(key=lambda x: (x.count("/"), x), reverse=True)
 
-        summary = Table(show_header=True, header_style="bold", box=None)
-        summary.add_column("动作")
-        summary.add_column("数量", justify="right")
-        summary.add_column("说明")
+        action_width = 12
+        detail_width = 52
+        note_width = 16
 
-        def add_row(action: str, n: int, note: str) -> None:
+        summary = Table(show_header=True, header_style="bold", box=None)
+        summary.add_column("动作", width=action_width, no_wrap=True)
+        summary.add_column("数量", width=detail_width)
+        summary.add_column("说明", width=note_width)
+
+        def add_summary(action: str, n: int, note: str) -> None:
             if n:
                 summary.add_row(action, str(n), note)
 
-        add_row("忽略远端空文件", len(getattr(p, "ignored_empty_remote", []) or []), "0B：不会下载/替换")
-        add_row("保留本地空文件", len(getattr(p, "ignored_empty_local", []) or []), "0B：不参与删除")
-        add_row("创建本地文件夹", len(dirs_to_create), "只在需要时创建")
-        add_row("替换本地不同文件", len(replace_files), "删除后下载")
-        add_row("下载本地缺失文件", len(download_files), "仅缺失项")
-        add_row("删除本地多余文件", len(extra_files), "仅镜像模式")
-        add_row("清理本地空文件夹", len(dirs_to_delete), "推测（以实际清理为准）")
+        add_summary("忽略空文件", len(getattr(p, "ignored_empty_remote", []) or []), "0B：不会下载/替换")
+        add_summary("保留空文件", len(getattr(p, "ignored_empty_local", []) or []), "0B：不参与删除")
+        add_summary("创建文件夹", len(dirs_to_create), "只在需要时创建")
+        add_summary("替换文件", len(replace_files), "删除后下载")
+        add_summary("下载缺失", len(download_files), "仅缺失项")
+        add_summary("删除多余", len(extra_files), "仅镜像模式")
+        add_summary("清理空文件夹", len(dirs_to_delete), "推测")
 
-        console.print(Panel(summary, title="操作计划 (--plan)", expand=False))
+        details = Table(show_header=True, header_style="bold", box=None)
+        details.add_column("动作", width=action_width, no_wrap=True)
+        details.add_column("路径", width=detail_width)
+        details.add_column("说明", width=note_width)
 
         rows: list[tuple[str, str, str]] = []
 
@@ -538,13 +545,6 @@ class GroupFileSyncer:
         for it in dirs_to_delete:
             rows.append(("RMDIR", it, "镜像：清理空文件夹(推测)"))
 
-        if rows:
-            self._print_plan_table(rows, title="计划明细", limit=200)
-
-        console.print("[dim]注：真实执行会写入群状态文件与时间戳缓存（--plan 不会写入）。[/dim]")
-
-    def _print_plan_table(self, rows: list[tuple[str, str, str]], *, title: str, limit: int = 200) -> None:
-
         style_map: dict[str, str] = {
             "IGNORE_EMPTY_REMOTE": "yellow",
             "IGNORE_EMPTY_LOCAL": "yellow",
@@ -554,20 +554,27 @@ class GroupFileSyncer:
             "DELETE": "red",
             "RMDIR": "red",
         }
+        for action, path, note in rows:
+            st = style_map.get(action, "")
+            details.add_row(Text(action, style=st), path, note)
+        if len(rows) > 200:
+            details.add_row("...", f"...（已截断，剩余 {len(rows) - 200} 项）", "")
 
+        divider = Text("─" * (action_width + detail_width + note_width + 6), style="dim")
+        console.print(Panel(Group(summary, divider, details), title="操作计划", expand=False))
+
+
+    def _build_plan_table(self, rows: list[tuple[str, str, str]], *, limit: int = 200) -> Table:
         table = Table(show_header=True, header_style="bold", box=None)
         table.add_column("动作", no_wrap=True)
         table.add_column("路径")
         table.add_column("说明")
-
         show = rows[:limit]
         for action, path, note in show:
-            st = style_map.get(action, "")
-            table.add_row(Text(action, style=st), path, note)
-
-        console.print(Panel(table, title=title, expand=False))
+            table.add_row(action, path, note)
         if len(rows) > limit:
-            console.print(f"[dim]...（已截断，剩余 {len(rows) - limit} 项）[/dim]")
+            table.add_row("...", f"...（已截断，剩余 {len(rows) - limit} 项）", "")
+        return table
 
     def _list_local_files_rel(self, group_root: str) -> tuple[set[str], set[str]]:
 

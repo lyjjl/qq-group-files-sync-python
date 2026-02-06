@@ -449,7 +449,7 @@ class GroupFilePusher:
         add_row("替换远端不同文件", len(to_replace), "删除后上传")
         add_row("上传远端缺失文件", len(to_upload), "仅缺失项")
 
-        console.print(Panel(summary, title="操作计划 (--plan)", expand=False))
+        console.print(Panel(summary, title="操作计划", expand=False))
 
         rows: list[tuple[str, str, str]] = []
 

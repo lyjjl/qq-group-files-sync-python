@@ -175,7 +175,7 @@ async def _sync_all(
         except Exception:
             logging.getLogger(__name__).exception("failed to build dashboard")
 
-    msg = ("对比完成（未执行修改）！" if plan else "同步全部完成！") + f"成功: {ok} 个群组"
+    msg = ("对比完成！" if plan else "同步全部完成！") + f"成功: {ok} 个群组"
     if failed:
         msg += f"，失败: {len(failed)} 个群组 ({', '.join(failed)})"
 
@@ -194,7 +194,8 @@ async def _sync_all(
         msg += f"\n总失效文件: {total_invalid}"
         msg += f"\n详见 {getattr(cfg, 'invalid_files_log', 'invalidFiles.log')}"
 
-    msg += f"\n文件已保存到: {fs.base_path}"
+    if not plan:
+        msg += f"\n文件已保存到: {fs.base_path}"
     console.print(Panel(msg, title=("对比完成" if plan else "同步完成"), expand=False))
 
 
@@ -383,7 +384,9 @@ def pull(
                     logging.getLogger(__name__).exception("failed to build dashboard")
 
             title = "对比完成" if plan else "同步完成"
-            body = f"{gid_str}\n文件已保存到: {fs.base_path}"
+            body = f"{gid_str}"
+            if not plan:
+                body += f"\n文件已保存到: {fs.base_path}"
             invalid_n = int(syncer.get_invalid_counts().get(gid_str, 0))
             if invalid_n:
                 body += f"\n失效文件: {invalid_n}（详见 {getattr(cfg, 'invalid_files_log', 'invalidFiles.log')}）"
@@ -459,7 +462,7 @@ def push(
                         logging.getLogger(__name__).exception("push failed")
                         failed.append(alias)
 
-                msg = ("对比完成（未执行修改）！" if plan else "推送全部完成！") + f"成功: {ok} 个群组"
+                msg = ("对比完成！" if plan else "推送全部完成！") + f"成功: {ok} 个群组"
                 if failed:
                     msg += f"，失败: {len(failed)} 个群组 ({', '.join(failed)})"
                 msg += f"\n本地数据目录: {fs.base_path}"
