@@ -146,6 +146,16 @@ title = "群文件导航"
 base_url = ""
 dashboard_file = "list.html"
 
+[sync]
+# 文件夹重命名相似度阈值（0.0 ~ 1.0）
+folder_rename_similarity = 0.5
+# 获取文件资源链接的并发数（M）
+url_workers = 4
+# 下载文件的并发数（N）
+download_workers = 4
+# 连续 invalid_url 次数阈值（达到后跳过该文件）
+invalid_url_threshold = 3
+
 ```
 
 ---

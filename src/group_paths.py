@@ -35,6 +35,10 @@ def group_timestamp_file_path(group_id: str) -> str:
     return f"{group_root_dir(group_id)}_timestamps.txt"
 
 
+def group_invalid_url_count_file_path(group_id: str) -> str:
+    return f"invalidFiles/{group_root_dir(group_id)}.json"
+
+
 def group_relative_file_path(folder_path: str, file_name: str) -> str:
     file_name = sanitize_component(file_name)
     if not folder_path:

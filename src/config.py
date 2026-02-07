@@ -44,6 +44,35 @@ class WebConfig(BaseModel):
     dashboard_file: str = Field(default="list.html", alias="dashboardFile")
 
 
+class SyncConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    folder_rename_similarity: float = Field(
+        default=0.5,
+        alias="folderRenameSimilarity",
+        ge=0.0,
+        le=1.0,
+        description="文件夹重命名的相似文件比例阈值",
+    )
+    url_workers: int = Field(
+        default=4,
+        alias="urlWorkers",
+        ge=1,
+        description="获取文件资源链接的并发数",
+    )
+    download_workers: int = Field(
+        default=4,
+        alias="downloadWorkers",
+        ge=1,
+        description="下载文件的并发数",
+    )
+    invalid_url_threshold: int = Field(
+        default=3,
+        alias="invalidUrlThreshold",
+        ge=1,
+        description="连续 invalid_url 次数阈值，超过后跳过该文件",
+    )
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
     onebot11: OneBot11Config = Field(default_factory=OneBot11Config, alias="oneBot11")
@@ -53,6 +82,7 @@ class AppConfig(BaseModel):
     invalid_files_log: str = Field(default="./logs/invalidFiles.log", alias="invalidFilesLog")
     groups: list[GroupConfig] = Field(default_factory=list, alias="groups")
     web: WebConfig = Field(default_factory=WebConfig, alias="web")
+    sync: SyncConfig = Field(default_factory=SyncConfig, alias="sync")
 
 
 def _parse_json_line(text: str) -> dict[str, Any]:
@@ -77,6 +107,7 @@ def default_config() -> AppConfig:
         log_file="./logs/main.log",
         log_level="info",
         invalid_files_log="./logs/invalidFiles.log",
+        sync=SyncConfig(folder_rename_similarity=0.5, url_workers=4, download_workers=4, invalid_url_threshold=3),
         groups=[
             GroupConfig(
                 id="QQ-Group:123456",
@@ -224,6 +255,17 @@ def render_config_toml(cfg: AppConfig) -> str:
     lines.append(f"base_url = {_toml_quote(cfg.web.base_url)}")
     lines.append("# 输出文件名（写入到 file_system.local_path 下）")
     lines.append(f"dashboard_file = {_toml_quote(cfg.web.dashboard_file)}")
+    lines.append("")
+
+    lines.append("[sync]")
+    lines.append("# 文件夹重命名相似度阈值（0.0 ~ 1.0）")
+    lines.append(f"folder_rename_similarity = {float(cfg.sync.folder_rename_similarity)}")
+    lines.append("# 获取文件资源链接的并发数（M）")
+    lines.append(f"url_workers = {int(cfg.sync.url_workers)}")
+    lines.append("# 下载文件的并发数（N）")
+    lines.append(f"download_workers = {int(cfg.sync.download_workers)}")
+    lines.append("# 连续 invalid_url 次数阈值（达到后跳过该文件）")
+    lines.append(f"invalid_url_threshold = {int(cfg.sync.invalid_url_threshold)}")
     lines.append("")
 
     return "\n".join(lines)

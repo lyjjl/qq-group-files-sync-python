@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import typer
-from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
 
@@ -20,9 +19,9 @@ from onebot import OneBotWsClient, extract_plain_text, parse_group_numeric_id
 from pusher import GroupFilePusher
 from syncer import GroupFileSyncer
 from ignore_rules import IgnoreMatcher
+from ui_console import console
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
-console = Console()
 
 
 _LEVEL_MAP: dict[str, int] = {
@@ -81,6 +80,7 @@ def _setup_logging(log_file: str, log_level: str) -> int:
     # Console handler (Rich)
     # IMPORTANT: RichHandler already renders time/level; keep console formatter minimal to avoid duplication.
     console_handler = RichHandler(
+        console=console,
         rich_tracebacks=(level <= logging.DEBUG),
         show_time=True,
         show_level=True,
@@ -381,7 +381,10 @@ def _run_with_ws(console_level: int, cfg, runner) -> None:
 def pull(
     target: str = typer.Argument(..., help="all 或群号：QQ-Group:123456 / 纯数字"),
     config: str = typer.Option("config.toml", "--config", help="配置文件路径（推荐 TOML）"),
-    concurrency: int = typer.Option(4, "--concurrency", min=1, max=32, help="并发下载数"),
+    concurrency: int | None = typer.Option(None, "--concurrency", min=1, max=64, help="下载并发数（N，默认使用配置文件）"),
+    url_workers: int | None = typer.Option(None, "--url-workers", min=1, max=64, help="获取资源链接并发数（M，默认使用配置文件）"),
+    ignore_invalid_record: bool = typer.Option(False, "--ignore-invalid-record", help="忽略失效文件记录（不跳过）"),
+    reset_invalid_record: bool = typer.Option(False, "--reset-invalid-record", help="重置失效文件记录"),
     web: bool = typer.Option(False, "-w", "--web", help="同步完成后生成/更新展示页面"),
     mirror: bool = typer.Option(False, "--mirror", help="镜像模式：覆盖不同文件、删除本地多余文件（按文件名+大小判断）"),
     plan: bool = typer.Option(False, "--plan", help="只对比并输出将执行的操作，不做任何修改"),
@@ -401,7 +404,17 @@ def pull(
 
     async def runner() -> None:
         async with OneBotWsClient(cfg.onebot11.ws_url, cfg.onebot11.access_token) as bot:
-            syncer = GroupFileSyncer(cfg, fs, concurrency=concurrency, ignore=ignore)
+            download_workers = int(cfg.sync.download_workers) if concurrency is None else int(concurrency)
+            url_w = int(cfg.sync.url_workers) if url_workers is None else int(url_workers)
+            syncer = GroupFileSyncer(
+                cfg,
+                fs,
+                concurrency=download_workers,
+                url_workers=url_w,
+                ignore_invalid_record=ignore_invalid_record,
+                reset_invalid_record=reset_invalid_record,
+                ignore=ignore,
+            )
             if pull_all:
                 await _sync_all(cfg, fs, bot, syncer, build_dashboard=web, mirror=mirror, plan=plan)
                 return
@@ -447,12 +460,14 @@ def push(
     target: str = typer.Argument(..., help="all 或群号：QQ-Group:123456 / 纯数字"),
     config: str = typer.Option("config.toml", "--config", help="配置文件路径（推荐 TOML）"),
     concurrency: int = typer.Option(2, "--concurrency", min=1, max=16, help="并发上传数"),
+    url_workers: int | None = typer.Option(None, "--url-workers", min=1, max=64, help="获取资源链接并发数（M，默认使用配置文件）"),
     mirror: bool = typer.Option(False, "--mirror", help="镜像模式：覆盖不同文件、删除远端多余文件（按文件名+大小判断）"),
     plan: bool = typer.Option(False, "--plan", help="只对比并输出将执行的操作，不做任何修改"),
     ignore_file: str | None = typer.Option(None, "--ignore-file", help="忽略规则文件路径（相对路径）。默认读取 ./.ignore（如存在）"),
 ) -> None:
     cfg, console_level = _load_cfg_and_logging(config)
     fs, ignore = _build_fs_and_ignore(cfg, ignore_file)
+    _ = url_workers  # keep CLI signature consistent; push doesn't fetch resource URLs
     push_all = (target or "").strip().lower() == "all"
 
     if push_all and is_placeholder_config(cfg):
@@ -463,7 +478,7 @@ def push(
 
     async def runner() -> None:
         async with OneBotWsClient(cfg.onebot11.ws_url, cfg.onebot11.access_token) as bot:
-            pusher = GroupFilePusher(fs, concurrency=concurrency, ignore=ignore)
+            pusher = GroupFilePusher(fs, concurrency=concurrency, ignore=ignore, cfg=cfg)
 
             if push_all:
                 if not cfg.groups:
@@ -511,7 +526,10 @@ def push(
 @app.command(help="进入交互等待模式（可在群里发指令触发同步）")
 def watch(
     config: str = typer.Option("config.toml", "--config", help="配置文件路径"),
-    concurrency: int = typer.Option(4, "--concurrency", min=1, max=32, help="并发下载数"),
+    concurrency: int | None = typer.Option(None, "--concurrency", min=1, max=64, help="下载并发数（N，默认使用配置文件）"),
+    url_workers: int | None = typer.Option(None, "--url-workers", min=1, max=64, help="获取资源链接并发数（M，默认使用配置文件）"),
+    ignore_invalid_record: bool = typer.Option(False, "--ignore-invalid-record", help="忽略失效文件记录（不跳过）"),
+    reset_invalid_record: bool = typer.Option(False, "--reset-invalid-record", help="重置失效文件记录"),
     ignore_file: str | None = typer.Option(None, "--ignore-file", help="忽略规则文件路径（相对路径）。默认读取 ./.ignore（如存在）"),
 ) -> None:
     cfg, console_level = _load_cfg_and_logging(config)
@@ -525,7 +543,17 @@ def watch(
 
     async def runner() -> None:
         async with OneBotWsClient(cfg.onebot11.ws_url, cfg.onebot11.access_token) as bot:
-            syncer = GroupFileSyncer(cfg, fs, concurrency=concurrency, ignore=ignore)
+            download_workers = int(cfg.sync.download_workers) if concurrency is None else int(concurrency)
+            url_w = int(cfg.sync.url_workers) if url_workers is None else int(url_workers)
+            syncer = GroupFileSyncer(
+                cfg,
+                fs,
+                concurrency=download_workers,
+                url_workers=url_w,
+                ignore_invalid_record=ignore_invalid_record,
+                reset_invalid_record=reset_invalid_record,
+                ignore=ignore,
+            )
             await _interactive(cfg, fs, bot, syncer)
 
     _run_with_ws(console_level, cfg, runner)

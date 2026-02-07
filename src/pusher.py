@@ -2,21 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from config import AppConfig
 from filesystem import FileSystemManager
 from group_paths import group_root_dir, sanitize_component
 from onebot import OneBotWsClient, parse_group_numeric_id
 from ignore_rules import IgnoreMatcher
 from local_files import filter_ignored, list_group_files, split_files_by_size
+from progress_ui import create_progress
+from ui_console import console
+from plan_output import print_plan_panel
 
-console = Console()
 
 
 @dataclass
@@ -24,6 +27,7 @@ class RemoteFolder:
     folder_id: str
     folder_name: str
     folder_path: str
+    total_file_count: int = 0
 
 
 @dataclass
@@ -68,10 +72,21 @@ def _okish(result) -> bool:
 class GroupFilePusher:
     """上传本地文件到群文件"""
 
-    def __init__(self, fs: FileSystemManager, *, concurrency: int = 2, ignore: IgnoreMatcher | None = None):
+    def __init__(
+        self,
+        fs: FileSystemManager,
+        *,
+        concurrency: int = 2,
+        ignore: IgnoreMatcher | None = None,
+        cfg: AppConfig | None = None,
+    ):
         self.fs = fs
         self.concurrency = max(1, int(concurrency))
         self.ignore = ignore
+        if cfg is None:
+            self.folder_rename_similarity = 0.5
+        else:
+            self.folder_rename_similarity = float(cfg.sync.folder_rename_similarity)
 
 
     async def push_group(self, bot: OneBotWsClient, group_id_str: str, *, mirror: bool = False, plan: bool = False) -> None:
@@ -119,6 +134,40 @@ class GroupFilePusher:
         to_upload = sorted([k for k in local_keys_non_empty if k not in remote_keys])
         to_replace = sorted([k for k in (local_keys_non_empty & remote_keys) if int(local_size.get(k, -1)) != int(remote_files[k].file_size)])
         to_delete = sorted([k for k in (remote_keys - local_keys_protect)])
+        local_dirs = self._list_local_dirs_rel(group_root)
+        empty_remote_dirs = self._find_empty_remote_folders(remote_files, remote_folders, local_dirs)
+
+        remote_rel_size_map = {k: int(v.file_size) for k, v in remote_files.items() if int(v.file_size) > 0}
+        folder_renames = self._detect_folder_renames(
+            old_all=set(remote_rel_size_map.keys()),
+            old_removed=set(to_delete),
+            old_size_map=remote_rel_size_map,
+            new_all=set(local_keys_non_empty),
+            new_added=set(to_upload),
+            new_size_map=local_size,
+            min_overlap_ratio=self.folder_rename_similarity,
+        )
+
+        rename_moves: list[tuple[str, str, RemoteFile]] = []
+        if folder_renames:
+            to_upload_set = set(to_upload)
+            to_delete_set = set(to_delete)
+            for old, new in folder_renames:
+                prefix = f"{old}/"
+                for path, rf in remote_files.items():
+                    if not path.startswith(prefix):
+                        continue
+                    rel = path[len(prefix) :]
+                    dst_key = f"{new}/{rel}" if new else rel
+                    if dst_key in remote_files:
+                        continue
+                    if int(local_size.get(dst_key, -1)) != int(rf.file_size):
+                        continue
+                    rename_moves.append((rf.folder_path, dst_key, rf))
+                    to_upload_set.discard(dst_key)
+                    to_delete_set.discard(path)
+            to_upload = sorted(to_upload_set)
+            to_delete = sorted(to_delete_set)
 
         to_move: list[tuple[str, str, RemoteFile]] = []
         if to_upload and to_delete:
@@ -147,9 +196,9 @@ class GroupFilePusher:
                     rf = extras.pop()
                     to_move.append((rf.folder_path, dst_key, rf))
 
-        if to_move:
-            moved_src = {(rf.folder_path, rf.file_name) for _, _, rf in to_move}
-            moved_dst = {dst_key for _, dst_key, _ in to_move}
+        if rename_moves or to_move:
+            moved_src = {(rf.folder_path, rf.file_name) for _, _, rf in (rename_moves + to_move)}
+            moved_dst = {dst_key for _, dst_key, _ in (rename_moves + to_move)}
             to_upload = [k for k in to_upload if k not in moved_dst]
             to_delete = [
                 k for k in to_delete
@@ -159,12 +208,20 @@ class GroupFilePusher:
         overview = Table(show_header=False, box=None)
         overview.add_column("项")
         overview.add_column("值", justify="right")
-        overview.add_row("远端文件", str(len(remote_keys)))
-        overview.add_row("本地文件", f"{len(local_keys_non_empty)}（空文件忽略 {len(local_empty)}）")
-        overview.add_row("待上传", str(len(to_upload)))
-        overview.add_row("待替换", str(len(to_replace)))
-        overview.add_row("可移动替代上传/删除", str(len(to_move)))
-        overview.add_row("待删除远端多余", str(len(to_delete)))
+        overview.add_row("目标文件", str(len(remote_keys)))
+        overview.add_row("来源文件", f"{len(local_keys_non_empty)} (空文件忽略 {len(local_empty)})")
+        if folder_renames:
+            overview.add_row("文件夹重命名", str(len(folder_renames)))
+        if to_upload:
+            overview.add_row("待上传", str(len(to_upload)))
+        if to_replace:
+            overview.add_row("待替换", str(len(to_replace)))
+        if rename_moves or to_move:
+            overview.add_row("可移动替代上传/删除", str(len(rename_moves) + len(to_move)))
+        if to_delete:
+            overview.add_row("待删除多余", str(len(to_delete)))
+        if empty_remote_dirs:
+            overview.add_row("待删除空文件夹", str(len(empty_remote_dirs)))
         console.print(Panel(overview, title=f"镜像推送对比 {group_id_str}", expand=False))
 
         if plan:
@@ -173,19 +230,41 @@ class GroupFilePusher:
                 to_upload=to_upload,
                 to_replace=to_replace,
                 to_delete=to_delete,
-                to_move=[dst for _src, dst, _rf in to_move],
+                to_move=[dst for _src, dst, _rf in (rename_moves + to_move)],
+                rename_dirs=folder_renames,
+                empty_remote_dirs=empty_remote_dirs,
                 ignored_empty=local_empty,
             )
             return
 
         if local_empty:
             logging.getLogger(__name__).warning("ignored %d empty local file(s) (0B) for group=%s", len(local_empty), group_id_str)
-            console.print(f"[yellow]WARN[/yellow]: 已忽略 {len(local_empty)} 个本地空文件(0B)，不会上传/替换，也不会触发远端删除。")
+            console.print(f"[yellow]WARN[/yellow]: 已忽略 {len(local_empty)} 个空文件(0B)，不会上传/替换，也不会触发删除。")
 
         # 确保顶级文件夹存在
 
         semaphore = asyncio.Semaphore(self.concurrency)
         failures: list[str] = []
+
+        total_upload_bytes = 0
+        for k in (to_upload + to_replace):
+            try:
+                abs_path = self.fs.resolve(f"{group_root}/{k}")
+                total_upload_bytes += int(abs_path.stat().st_size)
+            except Exception:
+                total_upload_bytes += max(0, int(local_size.get(k, 0) or 0))
+
+        progress = None
+        progress_task = None
+        if total_upload_bytes > 0:
+            progress = create_progress(console, description="同步")
+            progress_task = progress.add_task(
+                "同步",
+                total=max(0, int(total_upload_bytes)),
+                phase1_total=1,
+                phase1_done=1,
+            )
+            progress.start()
 
         async def delete_remote(key: str) -> None:
             rf = remote_files.get(key)
@@ -197,7 +276,7 @@ class GroupFilePusher:
                     f"delete_group_file failed: retcode={getattr(res,'retcode',None)} status={getattr(res,'status',None)}"
                 )
 
-        async def upload_local(key: str) -> None:
+        async def upload_local(key: str) -> int:
             folder_path, file_name = self._split_key(key)
             target_folder_id = await self._ensure_folder(bot, group_id_num, folder_path_to_id, folder_path)
 
@@ -207,9 +286,13 @@ class GroupFilePusher:
             try:
                 if abs_path.stat().st_size == 0:
                     logging.getLogger(__name__).warning("skip upload empty file (0B): group=%s path=%s", group_id_str, abs_path)
-                    return
+                    return 0
             except Exception:
                 pass
+            try:
+                size = int(abs_path.stat().st_size)
+            except Exception:
+                size = max(0, int(local_size.get(key, 0) or 0))
             logging.getLogger(__name__).debug(
                 "upload_group_file: group=%s file=%s name=%s", group_id_str, abs_path, file_name
             )
@@ -224,14 +307,17 @@ class GroupFilePusher:
                 raise RuntimeError("upload_group_file returned empty file_id")
 
             if target_folder_id:
-                return
+                return size
+            return size
 
         async def handle_replace_or_upload(key: str, *, replace: bool) -> None:
             async with semaphore:
                 try:
                     if replace:
                         await delete_remote(key)
-                    await upload_local(key)
+                    sz = await upload_local(key)
+                    if sz and progress and progress_task is not None:
+                        progress.update(progress_task, advance=sz)
                 except Exception:
                     logging.getLogger(__name__).exception("mirror push failed: group=%s key=%s", group_id_str, key)
                     failures.append(key)
@@ -255,25 +341,33 @@ class GroupFilePusher:
                     logging.getLogger(__name__).exception("move remote failed: group=%s key=%s", group_id_str, dst_key)
                     failures.append(dst_key)
 
-        tasks = []
-        tasks += [asyncio.create_task(move_remote(src, dst, rf)) for src, dst, rf in to_move]
-        tasks += [asyncio.create_task(handle_delete_only(k)) for k in to_delete]
-        tasks += [asyncio.create_task(handle_replace_or_upload(k, replace=True)) for k in to_replace]
-        tasks += [asyncio.create_task(handle_replace_or_upload(k, replace=False)) for k in to_upload]
+        try:
+            tasks = []
+            if rename_moves:
+                rename_tasks = [asyncio.create_task(move_remote(src, dst, rf)) for src, dst, rf in rename_moves]
+                await asyncio.gather(*rename_tasks)
+            tasks += [asyncio.create_task(move_remote(src, dst, rf)) for src, dst, rf in to_move]
+            tasks += [asyncio.create_task(handle_delete_only(k)) for k in to_delete]
+            tasks += [asyncio.create_task(handle_replace_or_upload(k, replace=True)) for k in to_replace]
+            tasks += [asyncio.create_task(handle_replace_or_upload(k, replace=False)) for k in to_upload]
 
-        if tasks:
-            await asyncio.gather(*tasks)
+            if tasks:
+                await asyncio.gather(*tasks)
+            await self._cleanup_remote_empty_folders(bot, group_id_num, group_id_str, local_dirs)
 
-        if failures:
-            console.print(
-                Panel(
-                    f"失败 {len(failures)} 个。\n详情请查看 error.log。",
-                    title="镜像推送结果",
-                    expand=False,
+            if failures:
+                console.print(
+                    Panel(
+                        f"失败 {len(failures)} 个。\n详情请查看 error.log。",
+                        title="镜像推送结果",
+                        expand=False,
+                    )
                 )
-            )
-        else:
-            console.print(Panel("全部成功", title="镜像推送结果", expand=False))
+            else:
+                console.print(Panel("全部成功", title="镜像推送结果", expand=False))
+        finally:
+            if progress:
+                progress.stop()
 
     async def push_group_missing_only(self, bot: OneBotWsClient, group_id_str: str, *, plan: bool = False) -> None:
         """将远端缺失的本地文件上传
@@ -299,8 +393,8 @@ class GroupFilePusher:
         overview = Table(show_header=False, box=None)
         overview.add_column("项")
         overview.add_column("值", justify="right")
-        overview.add_row("远端文件", str(len(remote_file_paths)))
-        overview.add_row("本地文件", f"{len(local_non_empty)}（空文件忽略 {len(ignored_empty)}）")
+        overview.add_row("目标文件", str(len(remote_file_paths)))
+        overview.add_row("来源文件", f"{len(local_non_empty)} (空文件忽略 {len(ignored_empty)})")
         overview.add_row("待上传", str(len(missing_local)))
         console.print(Panel(overview, title=f"推送对比 {group_id_str}", expand=False))
         if plan:
@@ -309,7 +403,7 @@ class GroupFilePusher:
 
         if ignored_empty:
             logging.getLogger(__name__).warning("ignored %d empty local file(s) (0B) for group=%s", len(ignored_empty), group_id_str)
-            console.print(f"[yellow]WARN[/yellow]: 已忽略 {len(ignored_empty)} 个本地空文件(0B)，不会上传。")
+            console.print(f"[yellow]WARN[/yellow]: 已忽略 {len(ignored_empty)} 个空文件(0B)，不会上传。")
 
         if not missing_local:
             return
@@ -319,6 +413,26 @@ class GroupFilePusher:
 
         semaphore = asyncio.Semaphore(self.concurrency)
         failures: list[str] = []
+
+        total_upload_bytes = 0
+        for k in missing_local:
+            try:
+                abs_path = self.fs.resolve(f"{group_root}/{k}")
+                total_upload_bytes += int(abs_path.stat().st_size)
+            except Exception:
+                pass
+
+        progress = None
+        progress_task = None
+        if total_upload_bytes > 0:
+            progress = create_progress(console, description="同步")
+            progress_task = progress.add_task(
+                "同步",
+                total=max(0, int(total_upload_bytes)),
+                phase1_total=1,
+                phase1_done=1,
+            )
+            progress.start()
 
         async def upload_one(rel_key: str) -> None:
             async with semaphore:
@@ -335,6 +449,10 @@ class GroupFilePusher:
                             return
                     except Exception:
                         pass
+                    try:
+                        size = int(abs_path.stat().st_size)
+                    except Exception:
+                        size = 0
                     logging.getLogger(__name__).debug(
                         "upload_group_file: group=%s file=%s name=%s", group_id_str, abs_path, file_name
                     )
@@ -349,25 +467,33 @@ class GroupFilePusher:
                         raise RuntimeError("upload_group_file returned empty file_id")
 
                     if target_folder_id:
+                        if size and progress and progress_task is not None:
+                            progress.update(progress_task, advance=size)
                         return
 
+                    if size and progress and progress_task is not None:
+                        progress.update(progress_task, advance=size)
                 except Exception:
                     logging.getLogger(__name__).exception("push failed: group=%s file=%s", group_id_str, rel_key)
                     failures.append(rel_key)
 
-        tasks = [asyncio.create_task(upload_one(k)) for k in missing_local]
-        await asyncio.gather(*tasks)
+        try:
+            tasks = [asyncio.create_task(upload_one(k)) for k in missing_local]
+            await asyncio.gather(*tasks)
 
-        if failures:
-            console.print(
-                Panel(
-                    f"失败 {len(failures)} 个。\n详情请查看 error.log。",
-                    title="上传结果",
-                    expand=False,
+            if failures:
+                console.print(
+                    Panel(
+                        f"失败 {len(failures)} 个。\n详情请查看 error.log。",
+                        title="上传结果",
+                        expand=False,
+                    )
                 )
-            )
-        else:
-            console.print(Panel("全部成功", title="上传结果", expand=False))
+            else:
+                console.print(Panel("全部成功", title="上传结果", expand=False))
+        finally:
+            if progress:
+                progress.stop()
 
     async def _fetch_remote_tree(self, bot: OneBotWsClient, group_id_num: int) -> tuple[dict[str, RemoteFile], dict[str, RemoteFolder]]:
         """返回 files_by_key, folders_by_path
@@ -403,7 +529,12 @@ class GroupFilePusher:
                 seen_folder_id.add(did)
                 dname = sanitize_component(str(d.get("folder_name", "")))
                 next_path = str(PurePosixPath(folder_path) / dname) if folder_path else dname
-                folders[next_path] = RemoteFolder(folder_id=did, folder_name=dname, folder_path=next_path)
+                folders[next_path] = RemoteFolder(
+                    folder_id=did,
+                    folder_name=dname,
+                    folder_path=next_path,
+                    total_file_count=int(d.get("total_file_count", 0) or 0),
+                )
 
             # recurse
             for d in data.get("folders", []) or []:
@@ -420,6 +551,113 @@ class GroupFilePusher:
         await fetch("", "")
         return files, folders
 
+    def _find_empty_remote_folders(
+        self,
+        remote_files: dict[str, RemoteFile],
+        remote_folders: dict[str, RemoteFolder],
+        local_dirs: set[str],
+    ) -> list[str]:
+        if not remote_folders:
+            return []
+        file_paths = set(remote_files.keys())
+        folder_paths = sorted(remote_folders.keys())
+        empty_folders: list[str] = []
+        for folder_path in folder_paths:
+            info = remote_folders.get(folder_path)
+            if not info:
+                continue
+            if folder_path in local_dirs:
+                continue
+            if int(info.total_file_count) > 0:
+                continue
+            prefix = f"{folder_path}/"
+            if any(p.startswith(prefix) for p in file_paths):
+                continue
+            if any(fp.startswith(prefix) for fp in folder_paths):
+                continue
+            empty_folders.append(folder_path)
+        return empty_folders
+
+    def _list_local_dirs_rel(self, group_root: str) -> set[str]:
+        root = self.fs.base_path / Path(group_root)
+        if not root.exists() or not root.is_dir():
+            return set()
+        out: set[str] = set()
+        for d in root.rglob("*"):
+            if not d.is_dir():
+                continue
+            rel = d.relative_to(root).as_posix()
+            if not rel:
+                continue
+            if self.ignore and self.ignore.is_ignored(rel):
+                continue
+            out.add(rel)
+        return out
+
+    async def _cleanup_remote_empty_folders(
+        self,
+        bot: OneBotWsClient,
+        group_id_num: int,
+        group_id_str: str,
+        local_dirs: set[str],
+    ) -> None:
+        try:
+            remote_files, remote_folders = await self._fetch_remote_tree(bot, group_id_num)
+        except Exception:
+            logging.getLogger(__name__).exception("failed to refresh remote tree for rename check: group=%s", group_id_str)
+            return
+
+        empty_folders = self._find_empty_remote_folders(remote_files, remote_folders, local_dirs)
+
+        if not empty_folders:
+            return
+
+        logging.getLogger(__name__).debug(
+            "found %d empty folder(s) after cleanup check: group=%s",
+            len(empty_folders),
+            group_id_str,
+        )
+
+        async def delete_folder(folder_path: str) -> bool:
+            info = remote_folders.get(folder_path)
+            if not info:
+                return False
+            res = await bot.call_api(
+                "delete_group_folder",
+                {"group_id": group_id_num, "folder_id": info.folder_id},
+            )
+            if not _okish(res):
+                raise RuntimeError(
+                    f"delete_group_folder failed: retcode={getattr(res,'retcode',None)} status={getattr(res,'status',None)}"
+                )
+            return True
+
+        deleted: list[str] = []
+        failed: list[str] = []
+        for folder_path in empty_folders:
+            try:
+                ok = await delete_folder(folder_path)
+                if ok:
+                    deleted.append(folder_path)
+            except Exception:
+                logging.getLogger(__name__).exception("delete empty remote folder failed: group=%s path=%s", group_id_str, folder_path)
+                failed.append(folder_path)
+
+        if deleted:
+            limit = 50
+            show = deleted[:limit]
+            body = "\n".join(show)
+            if len(deleted) > limit:
+                body += f"\n...（已截断，剩余 {len(deleted) - limit} 项）"
+            console.print(Panel(body, title="已删除空文件夹", expand=False))
+        if failed:
+            limit = 50
+            show = failed[:limit]
+            body = "\n".join(show)
+            if len(failed) > limit:
+                body += f"\n...（已截断，剩余 {len(failed) - limit} 项）"
+            console.print(Panel(body, title="删除空文件夹失败", expand=False))
+
     def _print_plan(
         self,
         remote_folders: dict[str, RemoteFolder],
@@ -428,6 +666,8 @@ class GroupFilePusher:
         to_replace: list[str],
         to_delete: list[str],
         to_move: list[str] | None = None,
+        rename_dirs: list[tuple[str, str]] | None = None,
+        empty_remote_dirs: list[str] | None = None,
         ignored_empty: list[str] | None = None,
     ) -> None:
         """当存在 --plan 参数时，打印预计执行的操作。"""
@@ -442,26 +682,21 @@ class GroupFilePusher:
         folders_to_create = sorted([p for p in needed_folders if "/" not in p])
         blocked_nested = sorted([p for p in needed_folders if "/" in p])
 
-        summary = Table(show_header=True, header_style="bold", box=None)
-        summary.add_column("动作")
-        summary.add_column("数量", justify="left")
-        summary.add_column("说明")
-
-        summary_rows = 0
+        summary_rows: list[tuple[str, int, str]] = []
 
         def add_row(action: str, n: int, note: str) -> None:
             if n:
-                summary.add_row(action, str(n), note)
-                nonlocal summary_rows
-                summary_rows += 1
+                summary_rows.append((action, int(n), note))
 
-        add_row("忽略本地空文件", len(ignored_empty or []), "0B：自动忽略")
-        add_row("创建远端一级文件夹", len(folders_to_create), "仅支持一级")
+        add_row("忽略空文件", len(ignored_empty or []), "0B：自动忽略")
+        add_row("创建一级文件夹", len(folders_to_create), "仅支持一级")
         add_row("缺失嵌套文件夹", len(blocked_nested), "需手动创建")
-        add_row("删除远端多余文件", len(to_delete), "仅镜像模式")
-        add_row("移动远端文件", len(to_move or []), "替代上传/删除")
-        add_row("替换远端不同文件", len(to_replace), "删除后上传")
-        add_row("上传远端缺失文件", len(to_upload), "仅缺失项")
+        add_row("删除多余文件", len(to_delete), "仅镜像模式")
+        add_row("重命名文件夹", len(rename_dirs or []), "先执行")
+        add_row("移动文件", len(to_move or []), "替代上传/删除")
+        add_row("替换不同文件", len(to_replace), "删除后上传")
+        add_row("上传缺失文件", len(to_upload), "仅缺失项")
+        add_row("删除空文件夹", len(empty_remote_dirs or []), "镜像模式")
 
         rows: list[tuple[str, str, str]] = []
 
@@ -469,53 +704,56 @@ class GroupFilePusher:
             rows.append(("IGNORE_EMPTY", it, "0B：自动忽略"))
 
         for it in folders_to_create:
-            rows.append(("MKDIR_REMOTE", it, "创建远端一级文件夹"))
+            rows.append(("MKDIR", it, "创建一级文件夹"))
 
         for it in blocked_nested:
             rows.append(("BLOCKED", it, "缺失嵌套文件夹：需手动创建"))
 
         for it in to_delete:
-            rows.append(("DELETE_REMOTE", it, "镜像：删除远端多余"))
+            rows.append(("DELETE", it, "镜像：删除多余"))
+
+        for src, dst in (rename_dirs or []):
+            rows.append(("RENAME_DIR", f"{src} -> {dst}", "重命名文件夹"))
+
+        for it in to_move or []:
+            rows.append(("MOVE", it, "移动到目标路径"))
 
         for it in to_replace:
-            rows.append(("REPLACE_REMOTE", it, "删除后上传"))
+            rows.append(("REPLACE", it, "删除后上传"))
 
         for it in to_upload:
             rows.append(("UPLOAD", it, "上传缺失"))
 
-        if summary_rows == 0 and not rows:
-            console.print(Panel("没有需要进行的操作。", title="操作计划", expand=False))
-            return
+        for it in (empty_remote_dirs or []):
+            rows.append(("RMDIR", it, "删除空文件夹"))
 
-        console.print(Panel(summary, title="操作计划", expand=False))
-        if rows:
-            self._print_plan_table(rows, title="计划明细", limit=200)
+        style_map: dict[str, str] = {
+            "IGNORE_EMPTY": "yellow",
+            "MKDIR": "cyan",
+            "BLOCKED": "yellow",
+            "DELETE": "red",
+            "RENAME_DIR": "cyan",
+            "REPLACE": "magenta",
+            "MOVE": "cyan",
+            "UPLOAD": "green",
+            "RMDIR": "red",
+        }
+        print_plan_panel(console, summary_rows, rows, style_map=style_map, title="操作计划", limit=200)
 
 
     def _print_plan_table(self, rows: list[tuple[str, str, str]], *, title: str, limit: int = 200) -> None:
         style_map: dict[str, str] = {
             "IGNORE_EMPTY": "yellow",
-            "MKDIR_REMOTE": "cyan",
+            "MKDIR": "cyan",
             "BLOCKED": "yellow",
-            "DELETE_REMOTE": "red",
-            "REPLACE_REMOTE": "magenta",
-            "MOVE_REMOTE": "cyan",
+            "DELETE": "red",
+            "RENAME_DIR": "cyan",
+            "REPLACE": "magenta",
+            "MOVE": "cyan",
             "UPLOAD": "green",
+            "RMDIR": "red",
         }
-
-        table = Table(show_header=True, header_style="bold", box=None)
-        table.add_column("动作", no_wrap=True)
-        table.add_column("路径")
-        table.add_column("说明")
-
-        show = rows[:limit]
-        for action, path, note in show:
-            st = style_map.get(action, "")
-            table.add_row(Text(action, style=st), path, note)
-
-        console.print(Panel(table, title=title, expand=False))
-        if len(rows) > limit:
-            console.print(f"[dim]...（已截断，剩余 {len(rows) - limit} 项）[/dim]")
+        print_plan_panel(console, [], rows, style_map=style_map, title=title, limit=limit)
 
     def _print_list(self, items: list[str], *, prefix: str) -> None:
         limit = 200
@@ -538,6 +776,102 @@ class GroupFilePusher:
         if folder == ".":
             folder = ""
         return folder, p.name
+
+    @staticmethod
+    def _folder_counts(paths: set[str]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for path in paths:
+            parts = PurePosixPath(path).parts
+            if len(parts) <= 1:
+                continue
+            for i in range(1, len(parts)):
+                folder = "/".join(parts[:i])
+                counts[folder] = counts.get(folder, 0) + 1
+        return counts
+
+    @staticmethod
+    def _folder_sigs(paths: set[str], size_map: dict[str, int]) -> dict[str, set[tuple[str, int]]]:
+        sigs: dict[str, set[tuple[str, int]]] = defaultdict(set)
+        for path in paths:
+            parts = PurePosixPath(path).parts
+            if len(parts) <= 1:
+                continue
+            size = int(size_map.get(path, -1))
+            for i in range(1, len(parts)):
+                folder = "/".join(parts[:i])
+                rel = "/".join(parts[i:])
+                sigs[folder].add((rel, size))
+        return sigs
+
+    @staticmethod
+    def _is_path_conflict(path: str, existing: list[str]) -> bool:
+        for it in existing:
+            if it == path:
+                return True
+            if it.startswith(path + "/") or path.startswith(it + "/"):
+                return True
+        return False
+
+    def _detect_folder_renames(
+        self,
+        *,
+        old_all: set[str],
+        old_removed: set[str],
+        old_size_map: dict[str, int],
+        new_all: set[str],
+        new_added: set[str],
+        new_size_map: dict[str, int],
+        min_overlap_ratio: float = 0.5,
+    ) -> list[tuple[str, str]]:
+        old_total = self._folder_counts(old_all)
+        old_removed_counts = self._folder_counts(old_removed)
+        new_total = self._folder_counts(new_all)
+        new_added_counts = self._folder_counts(new_added)
+
+        old_candidates = [
+            f for f, cnt in old_removed_counts.items()
+            if cnt and cnt == old_total.get(f, 0)
+        ]
+        new_candidates = [
+            f for f, cnt in new_added_counts.items()
+            if cnt and cnt == new_total.get(f, 0)
+        ]
+
+        old_sigs = self._folder_sigs(old_removed, old_size_map)
+        new_sigs = self._folder_sigs(new_added, new_size_map)
+
+        pairs: list[tuple[float, int, int, int, str, str]] = []
+        for old in old_candidates:
+            s1 = old_sigs.get(old)
+            if not s1:
+                continue
+            for new in new_candidates:
+                if old == new:
+                    continue
+                s2 = new_sigs.get(new)
+                if not s2:
+                    continue
+                overlap = len(s1 & s2)
+                if overlap == 0:
+                    continue
+                denom = max(len(s1), len(s2))
+                ratio = overlap / denom if denom else 0.0
+                if ratio >= min_overlap_ratio:
+                    pairs.append((ratio, overlap, len(s1), len(s2), old, new))
+
+        pairs.sort(reverse=True)
+        selected: list[tuple[str, str]] = []
+        selected_old: list[str] = []
+        selected_new: list[str] = []
+        for _ratio, _overlap, _a, _b, old, new in pairs:
+            if self._is_path_conflict(old, selected_old):
+                continue
+            if self._is_path_conflict(new, selected_new):
+                continue
+            selected.append((old, new))
+            selected_old.append(old)
+            selected_new.append(new)
+        return selected
 
     async def _ensure_folder(self, bot: OneBotWsClient, group_id_num: int, folder_path_to_id: dict[str, str], folder_path: str) -> str:
 
@@ -602,4 +936,4 @@ class GroupFilePusher:
                 return
         _require_ok("move_group_file", res)
         for it in sorted(to_move or []):
-            rows.append(("MOVE_REMOTE", it, "移动到目标路径"))
+            rows.append(("MOVE", it, "移动到目标路径"))
