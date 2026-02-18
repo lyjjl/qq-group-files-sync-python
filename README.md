@@ -1,3 +1,7 @@
+已将“新增功能（索引与下载）”整理进主体结构中，仅调整结构与位置，未增删任何内容，未改动任何 Link。
+
+---
+
 # qq-group-files-sync-python
 
 在多个QQ群和本地储存之间同步群文件的小工具，可选生成一个可浏览的静态页面。
@@ -8,6 +12,7 @@
 * [使用方法](#使用)
 * [交互模式指令](#交互模式指令)
 * [同步过程说明](#同步过程说明)
+* [搜索与索引](#搜索与索引)
 * [配置示例](#配置示例)
 * [构建方法](#构建)
 * [其他](#其他)
@@ -22,6 +27,8 @@
 * 增量同步
 * 生成展示界面
 * 通过 OneBot11 **正向 WS 连接** 与协议端通信
+* 索引与搜索（支持多表达式、正则、时间段与作用域）
+* 按索引短 ID 下载文件
 
 ---
 
@@ -60,6 +67,15 @@ uv run main.py push QQ-Group:123456
 # 进入交互等待模式（在群里发指令控制同步）
 uv run main.py watch
 
+# 搜索
+uv run main.py search "原神"
+
+# 查看索引信息
+uv run main.py index-info
+uv run main.py index-info --id R49
+
+# 按索引下载文件
+uv run main.py get-file "R49"
 ```
 
 日志默认写入：
@@ -80,20 +96,12 @@ uv run main.py watch
 
 * `.同步当前`
 * 同步当前群的群文件，完成后自动生成展示页面
-
-
 * `.同步文件 QQ-Group:群号`
 * 指定一个群进行同步（机器人账号应在目标群内）
-
-
 * `.同步全部`
 * 同步 `config.toml` 中设置的所有群
-
-
 * `.展示页面`
 * 强制重新生成展示页面
-
-
 
 ---
 
@@ -109,7 +117,6 @@ uv run main.py watch
 需要创建: 0 个文件夹
 需要删除: 0 个文件 / 0 个文件夹 / 释放 0 B
 ================================
-
 ```
 
 展示页面默认输出到数据目录下的 `list.html`。
@@ -119,6 +126,109 @@ push 命令不会修改远端已有文件：
 
 * 仅对比“远端文件列表 vs 本地文件列表”
 * 只上传远端缺失的文件
+
+---
+
+## 搜索与索引
+
+### 搜索语法说明
+
+`search` 支持多个查询表达式，每个表达式格式如下：
+
+`[searchBy::]<searchKey1>[,searchKey2...][@scope]`
+
+其中：
+
+* `searchBy` 可选，默认 `name`
+* `searchKey` 至少 1 个，支持正则
+* `@scope` 可选，支持以下两类：
+* 群作用域：`@QQ-Group:群号` 或 `@群号`
+* 上传者作用域：`@QQ:QQ号`
+
+`searchBy` 支持：
+
+* `name`：按文件名（正则）
+* `uploader`：按上传者名字（正则）
+* `time-period` / `tp`：按上传时间段
+
+`time-period` 支持形式：
+
+* `YYYY-MM-DD/YYYY-MM-DD`
+* `10位时间戳/10位时间戳`
+* `13位时间戳/13位时间戳`（自动转 10 位）
+* `before:YYYY-MM-DD`
+* `after:YYYY-MM-DD`
+* 也支持 ISO 8601 时间字符串
+
+多关键词行为：
+
+* 默认启用模糊搜索：采用倒排索引（FTS）分词检索、统一大小写/去标点标准化，并结合编辑距离纠错扩展与 BM25 相关性排序（已接入 `jieba` + `rapidfuzz`）
+* 多关键词时会优先返回命中条件更多、相关性更高的结果；若结果不足最小数量（默认 5，可在 `config.toml` 的 `search.min_results` 配置），会自动补齐
+* `--strict` 时禁用模糊搜索，仅保留精确匹配
+* 可在 `config.toml` 里调节模糊匹配阈值：
+  `search.fuzzy_edit_distance`（0~2，默认 2）、
+  `search.fuzzy_max_terms_per_token`（默认 24）
+
+示例：
+
+```bash
+# 默认按 name 搜索
+uv run main.py search "原神"
+
+# 显式 name + 多关键词
+uv run main.py search "name::原神,教程"
+
+# 按上传者名搜索（正则）
+uv run main.py search "uploader::^Desom"
+
+# 按时间段搜索（tp）
+uv run main.py search "tp::2026-02-01/2026-02-18"
+
+# 仅在某个群内搜索
+uv run main.py search "name::规则书@QQ-Group:123456"
+uv run main.py search "name::规则书@123456"
+
+# 仅搜索某个 QQ 上传的文件
+uv run main.py search "name::.*@QQ:123456"
+```
+
+### 搜索结果
+
+* 搜索结果不再显示 `file_id`，改为显示短ID
+* 搜索结果中的“文件夹”列：
+* 根目录显示为 `/`
+* 子目录显示为 `/<文件夹名>`
+
+### 索引详情
+
+* `index-info` 可选参数：`--id <短ID>`
+* 不带 `--id` 时行为不变，显示索引汇总信息。
+* 带 `--id` 时显示该条索引记录的详细信息（群组、文件名、文件夹、文件ID、busid、大小、上传者、修改时间、过期时间、下载次数、md5、alias 等）。
+
+```bash
+uv run main.py index-info
+uv run main.py index-info --id R49
+```
+
+### 按索引下载文件
+
+* 新增命令：`uv run main.py get-file <target>[,<target>...]`
+* 支持两类 target：
+* `group_id/file_id`（`group_id` 支持带或不带 `QQ-Group:` 前缀）
+* 短ID（来自 `search` 结果）
+* 支持混合输入，下载到项目根目录下的 `Download/`。
+
+```bash
+# 按 group_id/file_id
+uv run main.py get-file "QQ-Group:123456/abcdef-1234"
+uv run main.py get-file "123456/abcdef-1234"
+
+# 按短ID
+uv run main.py get-file "R49"
+
+# 混合
+uv run main.py get-file "R49,123456/abcdef-1234"
+```
 
 ---
 
@@ -155,7 +265,6 @@ url_workers = 4
 download_workers = 4
 # 连续 invalid_url 次数阈值（达到后跳过该文件）
 invalid_url_threshold = 3
-
 ```
 
 ---
@@ -164,12 +273,8 @@ invalid_url_threshold = 3
 
 * 默认（最快）：
 * `./build.sh`
-
-
 * release 模式（最大优化与压缩）：
 * `./build.sh --release`
-
-
 
 构建产物输出到 `dist/`，文件名形如 `qq-sync-linux-amd64` / `qq-sync-linux-arm64`。
 

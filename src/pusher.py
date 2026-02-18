@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -12,7 +11,9 @@ from rich.text import Text
 
 from config import AppConfig
 from filesystem import FileSystemManager
+from folder_rename import detect_folder_renames
 from group_paths import group_root_dir, sanitize_component
+from onebot_common import require_ok as _require_ok
 from onebot import OneBotWsClient, parse_group_numeric_id
 from ignore_rules import IgnoreMatcher
 from local_files import filter_ignored, list_group_files, split_files_by_size
@@ -36,23 +37,6 @@ class RemoteFile:
     file_name: str
     folder_path: str
     file_size: int
-
-
-def _require_ok(action: str, result) -> None:
-    """当 OneBot API 返回失败状态时在 message 或 wording 字段中可能有详细的说明
-    将这些信息呈现出来，以便用户确认具体原因。
-    """
-
-    rc = getattr(result, "retcode", None)
-    st = getattr(result, "status", None)
-    if rc != 0 or (st not in {"ok", "OK", "", None}):
-        msg = getattr(result, "message", None)
-        wording = getattr(result, "wording", None)
-        raise RuntimeError(
-            "OneBot API failed: "
-            f"{action} retcode={rc} status={st} message={msg!r} wording={wording!r}"
-        )
-
 
 def _okish(result) -> bool:
     """如果从response看起来执行成功，则返回 True
@@ -777,41 +761,6 @@ class GroupFilePusher:
             folder = ""
         return folder, p.name
 
-    @staticmethod
-    def _folder_counts(paths: set[str]) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for path in paths:
-            parts = PurePosixPath(path).parts
-            if len(parts) <= 1:
-                continue
-            for i in range(1, len(parts)):
-                folder = "/".join(parts[:i])
-                counts[folder] = counts.get(folder, 0) + 1
-        return counts
-
-    @staticmethod
-    def _folder_sigs(paths: set[str], size_map: dict[str, int]) -> dict[str, set[tuple[str, int]]]:
-        sigs: dict[str, set[tuple[str, int]]] = defaultdict(set)
-        for path in paths:
-            parts = PurePosixPath(path).parts
-            if len(parts) <= 1:
-                continue
-            size = int(size_map.get(path, -1))
-            for i in range(1, len(parts)):
-                folder = "/".join(parts[:i])
-                rel = "/".join(parts[i:])
-                sigs[folder].add((rel, size))
-        return sigs
-
-    @staticmethod
-    def _is_path_conflict(path: str, existing: list[str]) -> bool:
-        for it in existing:
-            if it == path:
-                return True
-            if it.startswith(path + "/") or path.startswith(it + "/"):
-                return True
-        return False
-
     def _detect_folder_renames(
         self,
         *,
@@ -823,55 +772,15 @@ class GroupFilePusher:
         new_size_map: dict[str, int],
         min_overlap_ratio: float = 0.5,
     ) -> list[tuple[str, str]]:
-        old_total = self._folder_counts(old_all)
-        old_removed_counts = self._folder_counts(old_removed)
-        new_total = self._folder_counts(new_all)
-        new_added_counts = self._folder_counts(new_added)
-
-        old_candidates = [
-            f for f, cnt in old_removed_counts.items()
-            if cnt and cnt == old_total.get(f, 0)
-        ]
-        new_candidates = [
-            f for f, cnt in new_added_counts.items()
-            if cnt and cnt == new_total.get(f, 0)
-        ]
-
-        old_sigs = self._folder_sigs(old_removed, old_size_map)
-        new_sigs = self._folder_sigs(new_added, new_size_map)
-
-        pairs: list[tuple[float, int, int, int, str, str]] = []
-        for old in old_candidates:
-            s1 = old_sigs.get(old)
-            if not s1:
-                continue
-            for new in new_candidates:
-                if old == new:
-                    continue
-                s2 = new_sigs.get(new)
-                if not s2:
-                    continue
-                overlap = len(s1 & s2)
-                if overlap == 0:
-                    continue
-                denom = max(len(s1), len(s2))
-                ratio = overlap / denom if denom else 0.0
-                if ratio >= min_overlap_ratio:
-                    pairs.append((ratio, overlap, len(s1), len(s2), old, new))
-
-        pairs.sort(reverse=True)
-        selected: list[tuple[str, str]] = []
-        selected_old: list[str] = []
-        selected_new: list[str] = []
-        for _ratio, _overlap, _a, _b, old, new in pairs:
-            if self._is_path_conflict(old, selected_old):
-                continue
-            if self._is_path_conflict(new, selected_new):
-                continue
-            selected.append((old, new))
-            selected_old.append(old)
-            selected_new.append(new)
-        return selected
+        return detect_folder_renames(
+            old_all=old_all,
+            old_removed=old_removed,
+            old_size_map=old_size_map,
+            new_all=new_all,
+            new_added=new_added,
+            new_size_map=new_size_map,
+            min_overlap_ratio=min_overlap_ratio,
+        )
 
     async def _ensure_folder(self, bot: OneBotWsClient, group_id_num: int, folder_path_to_id: dict[str, str], folder_path: str) -> str:
 
@@ -935,5 +844,3 @@ class GroupFilePusher:
             if getattr(res, "retcode", -1) == 0:
                 return
         _require_ok("move_group_file", res)
-        for it in sorted(to_move or []):
-            rows.append(("MOVE", it, "移动到目标路径"))

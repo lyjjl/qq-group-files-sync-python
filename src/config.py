@@ -73,6 +73,35 @@ class SyncConfig(BaseModel):
     )
 
 
+class SearchConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    min_results: int = Field(
+        default=5,
+        alias="minResults",
+        ge=1,
+        description="多条件搜索时，非 strict 模式下补齐结果的最小数量",
+    )
+    fuzzy_edit_distance: int = Field(
+        default=2,
+        alias="fuzzyEditDistance",
+        ge=0,
+        le=2,
+        description="模糊检索时允许的最大编辑距离（0 表示禁用纠错扩展）",
+    )
+    fuzzy_max_terms_per_token: int = Field(
+        default=24,
+        alias="fuzzyMaxTermsPerToken",
+        ge=4,
+        le=128,
+        description="每个词项在模糊扩展后保留的最大候选词数量",
+    )
+    index_db: str = Field(
+        default=".index/group_files.db",
+        alias="indexDb",
+        description="索引数据库路径（相对路径将以 file_system.local_path 为基准）",
+    )
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
     onebot11: OneBot11Config = Field(default_factory=OneBot11Config, alias="oneBot11")
@@ -83,6 +112,7 @@ class AppConfig(BaseModel):
     groups: list[GroupConfig] = Field(default_factory=list, alias="groups")
     web: WebConfig = Field(default_factory=WebConfig, alias="web")
     sync: SyncConfig = Field(default_factory=SyncConfig, alias="sync")
+    search: SearchConfig = Field(default_factory=SearchConfig, alias="search")
 
 
 def _parse_json_line(text: str) -> dict[str, Any]:
@@ -108,6 +138,12 @@ def default_config() -> AppConfig:
         log_level="info",
         invalid_files_log="./logs/invalidFiles.log",
         sync=SyncConfig(folder_rename_similarity=0.5, url_workers=4, download_workers=4, invalid_url_threshold=3),
+        search=SearchConfig(
+            min_results=5,
+            fuzzy_edit_distance=2,
+            fuzzy_max_terms_per_token=24,
+            index_db=".index/group_files.db",
+        ),
         groups=[
             GroupConfig(
                 id="QQ-Group:123456",
@@ -266,6 +302,17 @@ def render_config_toml(cfg: AppConfig) -> str:
     lines.append(f"download_workers = {int(cfg.sync.download_workers)}")
     lines.append("# 连续 invalid_url 次数阈值（达到后跳过该文件）")
     lines.append(f"invalid_url_threshold = {int(cfg.sync.invalid_url_threshold)}")
+    lines.append("")
+
+    lines.append("[search]")
+    lines.append("# 多条件搜索时，非 strict 模式下补齐的最小结果数")
+    lines.append(f"min_results = {int(cfg.search.min_results)}")
+    lines.append("# 模糊检索最大编辑距离（0~2；0 表示禁用拼写纠错扩展）")
+    lines.append(f"fuzzy_edit_distance = {int(cfg.search.fuzzy_edit_distance)}")
+    lines.append("# 每个词项模糊扩展后最多保留的候选词数量")
+    lines.append(f"fuzzy_max_terms_per_token = {int(cfg.search.fuzzy_max_terms_per_token)}")
+    lines.append("# 索引数据库路径（相对路径基于 file_system.local_path）")
+    lines.append(f"index_db = {_toml_quote(cfg.search.index_db)}")
     lines.append("")
 
     return "\n".join(lines)

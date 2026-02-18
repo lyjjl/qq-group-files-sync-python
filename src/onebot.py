@@ -18,6 +18,8 @@ class ActionResult:
     retcode: int
     data: Any
     echo: str
+    message: str
+    wording: str
 
 
 def _headers(access_token: str) -> dict[str, str]:
@@ -132,6 +134,8 @@ class OneBotWsClient:
             retcode=int(raw.get("retcode", -1)),
             data=raw.get("data"),
             echo=echo,
+            message=str(raw.get("message", "")),
+            wording=str(raw.get("wording", "")),
         )
 
     async def events(self) -> AsyncIterator[dict[str, Any]]:

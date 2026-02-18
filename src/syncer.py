@@ -8,7 +8,7 @@ import shutil
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from urllib.parse import urlparse
@@ -21,6 +21,7 @@ from rich.text import Text
 
 from config import AppConfig
 from filesystem import FileSystemManager
+from folder_rename import detect_folder_renames
 from group_paths import (
     group_root_dir,
     group_status_file_path,
@@ -29,6 +30,7 @@ from group_paths import (
     group_relative_file_path,
     sanitize_component,
 )
+from onebot_common import require_ok as _require_ok
 from onebot import OneBotWsClient, parse_group_numeric_id
 from ignore_rules import IgnoreMatcher
 from local_files import list_group_files, list_group_files_rel
@@ -101,6 +103,8 @@ class SyncPrediction:
     ignored_empty_remote: list[str]
     ignored_empty_local: list[str]
     dirs_to_create: list[str] = field(default_factory=list)
+    remote_scan_complete: bool = True
+    remote_scan_failed_paths: list[str] = field(default_factory=list)
 
 
 def _format_size(size: int) -> str:
@@ -131,19 +135,6 @@ def _is_valid_group_file_url(url: str) -> bool:
     if not p.netloc.endswith("ftn.qq.com"):
         return False
     return True
-
-
-def _require_ok(action: str, result) -> None:
-    rc = getattr(result, "retcode", None)
-    st = getattr(result, "status", None)
-    if rc != 0 or (st not in {"ok", "OK", "", None}):
-        msg = getattr(result, "message", None)
-        wording = getattr(result, "wording", None)
-        raise RuntimeError(
-            "OneBot API failed: "
-            f"{action} retcode={rc} status={st} message={msg!r} wording={wording!r}"
-        )
-
 
 class GroupFileSyncer:
     def __init__(
@@ -276,14 +267,19 @@ class GroupFileSyncer:
         if reason == "invalid_url":
             await self._record_invalid_url_count(group_id_str, rel_path)
 
-    async def get_complete_file_list(self, bot: OneBotWsClient, group_id_str: str) -> tuple[list[GroupFileInfo], list[GroupFolderInfo]]:
+    async def get_complete_file_list(
+        self, bot: OneBotWsClient, group_id_str: str
+    ) -> tuple[list[GroupFileInfo], list[GroupFolderInfo], bool, list[str]]:
         group_id_num = parse_group_numeric_id(group_id_str)
         files: list[GroupFileInfo] = []
         folders: list[GroupFolderInfo] = []
         seen_file: set[str] = set()
         seen_folder: set[str] = set()
+        scan_complete = True
+        failed_paths: set[str] = set()
 
         async def fetch(folder_id: str, folder_path: str) -> None:
+            nonlocal scan_complete
             if folder_id:
                 res = await bot.call_api(
                     "get_group_files_by_folder",
@@ -332,13 +328,22 @@ class GroupFileSyncer:
                 try:
                     await fetch(did, next_path)
                 except Exception:
+                    scan_complete = False
+                    failed_paths.add(next_path or "/")
+                    logging.getLogger(__name__).warning(
+                        "skip failed folder while listing remote files: group=%s folder=%s",
+                        group_id_str,
+                        next_path or "/",
+                    )
                     continue
 
         await fetch("", "")
-        return files, folders
+        return files, folders, scan_complete, sorted(failed_paths)
 
     async def generate_sync_prediction(self, bot: OneBotWsClient, group_id_str: str, *, mirror: bool = False) -> SyncPrediction:
-        remote_files_all, remote_folders = await self.get_complete_file_list(bot, group_id_str)
+        remote_files_all, remote_folders, remote_scan_complete, remote_scan_failed_paths = await self.get_complete_file_list(
+            bot, group_id_str
+        )
 
         # ignore
         if self.ignore:
@@ -434,12 +439,14 @@ class GroupFileSyncer:
         local_total_files = len(existing_set)
         local_total_size = sum(int(existing_size_map.get(p, 0)) for p in existing_set)
 
-        expected = {f"{group_root}/{group_relative_file_path(f.folder_path, f.file_name)}".replace("\\", "/") for f in remote_files}
-
         files_to_delete = 0
         delete_size = 0
         extra_local_files: list[str] = []
-        if mirror:
+        if mirror and remote_scan_complete:
+            expected = {
+                f"{group_root}/{group_relative_file_path(f.folder_path, f.file_name)}".replace("\\", "/")
+                for f in remote_files
+            }
             extra = [p for p in existing_set if p not in expected and p not in empty_local_full]
             files_to_delete = len(extra)
             delete_size = sum(int(existing_size_map.get(p, 0)) for p in extra)
@@ -451,7 +458,7 @@ class GroupFileSyncer:
                     extra_local_files.append(ps)
             extra_local_files.sort()
         folder_renames: list[tuple[str, str]] = []
-        if mirror:
+        if mirror and remote_scan_complete:
             local_rel_size_map = self._build_local_rel_size_map(existing_set, existing_size_map, empty_local_full, root_prefix)
             remote_rel_size_map = {
                 group_relative_file_path(f.folder_path, f.file_name): int(f.file_size)
@@ -534,6 +541,8 @@ class GroupFileSyncer:
             status=status,
             ignored_empty_remote=sorted(ignored_empty_remote),
             ignored_empty_local=sorted(set(ignored_empty_local)),
+            remote_scan_complete=bool(remote_scan_complete),
+            remote_scan_failed_paths=remote_scan_failed_paths,
         )
 
     async def sync_group(self, bot: OneBotWsClient, group_id_str: str, *, mirror: bool = False, plan: bool = False) -> None:
@@ -553,6 +562,16 @@ class GroupFileSyncer:
         if pred.ignored_empty_remote:
             logging.getLogger(__name__).warning("ignored %d empty file(s) (0B) for group=%s", len(pred.ignored_empty_remote), group_id_str)
             console.print(f"[yellow]WARN[/yellow]: 已忽略 {len(pred.ignored_empty_remote)} 个空文件(0B)，不会下载/替换。")
+        if mirror and (not pred.remote_scan_complete):
+            if pred.remote_scan_failed_paths:
+                preview = ", ".join(pred.remote_scan_failed_paths[:5])
+                more = ""
+                if len(pred.remote_scan_failed_paths) > 5:
+                    more = f" 等 {len(pred.remote_scan_failed_paths)} 个目录"
+                detail = f"（{preview}{more}）"
+            else:
+                detail = ""
+            console.print(f"[yellow]WARN[/yellow]: 远端目录列表不完整{detail}，本次镜像将跳过删除和重命名。")
 
         self.fs.mkdir_all(group_root)
 
@@ -567,7 +586,7 @@ class GroupFileSyncer:
 
         await self._download_updates(bot, group_id_str, group_root, pred.update_file_map, mirror=mirror)
 
-        if mirror:
+        if mirror and pred.remote_scan_complete:
             await self._cleanup_extra_files(pred.status, group_root)
 
         self.fs.write_text(
@@ -605,6 +624,8 @@ class GroupFileSyncer:
             f"{p.files_to_delete} 文件 / {p.folders_to_delete} 文件夹",
             _format_size(p.delete_size),
         )
+        if not getattr(p, "remote_scan_complete", True):
+            table.add_row("镜像保护", "远端清单不完整", "已跳过删除/重命名")
         if getattr(p, "ignored_empty_remote", None):
             table.add_row("忽略空文件", f"{len(p.ignored_empty_remote)}", "-")
 
@@ -644,7 +665,7 @@ class GroupFileSyncer:
         extra_files = p.extra_local_files if mirror else []
 
         dirs_to_delete: list[str] = []
-        if mirror:
+        if mirror and getattr(p, "remote_scan_complete", True):
             expected_files: set[str] = set()
             for f in p.status.files:
                 folder_path = str(f.get("folder_path") or "")
@@ -681,6 +702,8 @@ class GroupFileSyncer:
         add_summary("下载缺失", len(download_files), "仅缺失项")
         add_summary("删除多余", len(extra_files), "仅镜像模式")
         add_summary("清理空文件夹", len(dirs_to_delete), "推测（以实际清理为准）")
+        if mirror and (not getattr(p, "remote_scan_complete", True)):
+            add_summary("镜像保护", 1, "远端清单不完整：跳过删除/重命名")
 
         rows: list[tuple[str, str, str]] = []
 
@@ -999,41 +1022,6 @@ class GroupFileSyncer:
             except OSError:
                 pass
 
-    @staticmethod
-    def _folder_counts(paths: set[str]) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for path in paths:
-            parts = PurePosixPath(path).parts
-            if len(parts) <= 1:
-                continue
-            for i in range(1, len(parts)):
-                folder = "/".join(parts[:i])
-                counts[folder] = counts.get(folder, 0) + 1
-        return counts
-
-    @staticmethod
-    def _folder_sigs(paths: set[str], size_map: dict[str, int]) -> dict[str, set[tuple[str, int]]]:
-        sigs: dict[str, set[tuple[str, int]]] = defaultdict(set)
-        for path in paths:
-            parts = PurePosixPath(path).parts
-            if len(parts) <= 1:
-                continue
-            size = int(size_map.get(path, -1))
-            for i in range(1, len(parts)):
-                folder = "/".join(parts[:i])
-                rel = "/".join(parts[i:])
-                sigs[folder].add((rel, size))
-        return sigs
-
-    @staticmethod
-    def _is_path_conflict(path: str, existing: list[str]) -> bool:
-        for it in existing:
-            if it == path:
-                return True
-            if it.startswith(path + "/") or path.startswith(it + "/"):
-                return True
-        return False
-
     def _detect_folder_renames(
         self,
         *,
@@ -1045,55 +1033,15 @@ class GroupFileSyncer:
         remote_size_map: dict[str, int],
         min_overlap_ratio: float = 0.5,
     ) -> list[tuple[str, str]]:
-        local_total = self._folder_counts(local_all)
-        local_removed_counts = self._folder_counts(local_removed)
-        remote_total = self._folder_counts(remote_all)
-        remote_added_counts = self._folder_counts(remote_added)
-
-        old_candidates = [
-            f for f, cnt in local_removed_counts.items()
-            if cnt and cnt == local_total.get(f, 0)
-        ]
-        new_candidates = [
-            f for f, cnt in remote_added_counts.items()
-            if cnt and cnt == remote_total.get(f, 0)
-        ]
-
-        local_sigs = self._folder_sigs(local_removed, local_size_map)
-        remote_sigs = self._folder_sigs(remote_added, remote_size_map)
-
-        pairs: list[tuple[float, int, int, int, str, str]] = []
-        for old in old_candidates:
-            s1 = local_sigs.get(old)
-            if not s1:
-                continue
-            for new in new_candidates:
-                if old == new:
-                    continue
-                s2 = remote_sigs.get(new)
-                if not s2:
-                    continue
-                overlap = len(s1 & s2)
-                if overlap == 0:
-                    continue
-                denom = max(len(s1), len(s2))
-                ratio = overlap / denom if denom else 0.0
-                if ratio >= min_overlap_ratio:
-                    pairs.append((ratio, overlap, len(s1), len(s2), old, new))
-
-        pairs.sort(reverse=True)
-        selected: list[tuple[str, str]] = []
-        selected_old: list[str] = []
-        selected_new: list[str] = []
-        for _ratio, _overlap, _a, _b, old, new in pairs:
-            if self._is_path_conflict(old, selected_old):
-                continue
-            if self._is_path_conflict(new, selected_new):
-                continue
-            selected.append((old, new))
-            selected_old.append(old)
-            selected_new.append(new)
-        return selected
+        return detect_folder_renames(
+            old_all=local_all,
+            old_removed=local_removed,
+            old_size_map=local_size_map,
+            new_all=remote_all,
+            new_added=remote_added,
+            new_size_map=remote_size_map,
+            min_overlap_ratio=min_overlap_ratio,
+        )
 
     @staticmethod
     def _build_local_rel_size_map(

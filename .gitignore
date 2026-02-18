@@ -19,6 +19,7 @@ config.jsonl
 data/
 logs/
 test_data/
+Download/
 
 # Editor/IDE
 .idea/
@@ -30,3 +31,6 @@ build/
 .nuitka-cache/
 *.exe
 .tools/
+
+# Other
+data.7z

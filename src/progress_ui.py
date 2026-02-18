@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from rich.console import Console
-from rich.progress import Progress, ProgressColumn, Task, TextColumn, TimeElapsedColumn
+from rich.progress import MofNCompleteColumn, Progress, ProgressColumn, Task, TextColumn, TimeElapsedColumn
 from rich.text import Text
 
 
@@ -57,7 +57,7 @@ class DualPhaseBarColumn(ProgressColumn):
         return bar
 
 
-def create_progress(console: Console, *, description: str = "进度") -> Progress:
+def create_progress(console: Console, *, description: str = "进度", transient: bool = True) -> Progress:
     bar_width = max(20, min(60, int(console.width) - 40)) if getattr(console, "width", None) else 40
     return Progress(
         TextColumn(f"{description}"),
@@ -66,5 +66,22 @@ def create_progress(console: Console, *, description: str = "进度") -> Progres
         MbSpeedColumn(),
         TimeElapsedColumn(),
         console=console,
-        transient=True,
+        transient=transient,
+    )
+
+
+def create_count_progress(
+    console: Console,
+    *,
+    description: str = "进度",
+    transient: bool = False,
+) -> Progress:
+    bar_width = max(20, min(60, int(console.width) - 40)) if getattr(console, "width", None) else 40
+    return Progress(
+        TextColumn(f"{description}"),
+        DualPhaseBarColumn(bar_width=bar_width),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=transient,
     )

@@ -2,23 +2,31 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import signal
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import aiofiles
+import httpx
 import typer
 from rich.logging import RichHandler
 from rich.panel import Panel
+from rich.table import Table
 
 import websockets
 
 from config import load_config, is_placeholder_config, find_duplicate_group_ids
 from dashboard import generate_dashboard
 from filesystem import FileSystemManager
+from indexer import GroupFileIndexer
 from onebot import OneBotWsClient, extract_plain_text, parse_group_numeric_id
 from pusher import GroupFilePusher
+from progress_ui import create_count_progress, create_progress
 from syncer import GroupFileSyncer
 from ignore_rules import IgnoreMatcher
+from onebot_common import require_ok as _require_ok
 from ui_console import console
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -137,6 +145,198 @@ async def _send_group_text(bot: OneBotWsClient, group_id: int, text: str) -> Non
 
 def _fmt_group_id_str(group_id_num: int) -> str:
     return f"QQ-Group:{group_id_num}"
+
+
+def _fmt_group_display(group_id: str, group_name: str | None) -> str:
+    name = str(group_name or "").strip()
+    gid = str(group_id or "").strip()
+    if gid and name:
+        return f"{name} ({gid})"
+    if name:
+        return name
+    if gid:
+        return f"未知群名 ({gid})"
+    return gid
+
+
+def _fmt_ts_local(ts: int | None) -> str:
+    try:
+        n = int(ts or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return "-"
+    try:
+        return datetime.fromtimestamp(n).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "-"
+
+
+def _fmt_size(size: int | None) -> str:
+    try:
+        v = int(size or 0)
+    except Exception:
+        v = 0
+    unit = 1024.0
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    value = float(max(0, v))
+    idx = 0
+    while value >= unit and idx < len(units) - 1:
+        value /= unit
+        idx += 1
+    if idx == 0:
+        return f"{int(value)} {units[idx]}"
+    return f"{value:.1f} {units[idx]}"
+
+
+def _safe_download_name(name: str) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return "file"
+    text = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", text)
+    text = text.strip().strip(".")
+    return text or "file"
+
+
+def _dedupe_download_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    i = 1
+    while True:
+        candidate = parent / f"{stem} ({i}){suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def _parse_get_file_target_tokens(text: str) -> list[str]:
+    out: list[str] = []
+    for part in str(text or "").split(","):
+        token = part.strip()
+        if token:
+            out.append(token)
+    if not out:
+        raise ValueError("请至少提供一个下载目标")
+    return out
+
+
+def _print_index_update_stats(stats: dict[str, Any], *, title: str) -> None:
+    table = Table(show_header=True, header_style="bold", box=None)
+    table.add_column("群组")
+    table.add_column("远端文件", justify="right")
+    table.add_column("新增", justify="right")
+    table.add_column("更新", justify="right")
+    table.add_column("未变化", justify="right")
+    table.add_column("删除", justify="right")
+    table.add_column("状态")
+    table.add_column("错误")
+
+    total_remote = 0
+    total_inserted = 0
+    total_updated = 0
+    total_unchanged = 0
+    total_deleted = 0
+    total_failed = 0
+
+    rows: list[tuple[int, str, int, int, int, int, int, bool, str]] = []
+    for gid, s in stats.items():
+        failed = bool(getattr(s, "failed", False))
+        if failed:
+            total_failed += 1
+        remote = int(getattr(s, "total_remote", 0))
+        inserted = int(getattr(s, "inserted", 0))
+        updated = int(getattr(s, "updated", 0))
+        unchanged = int(getattr(s, "unchanged", 0))
+        deleted = int(getattr(s, "deleted", 0))
+        total_remote += remote
+        total_inserted += inserted
+        total_updated += updated
+        total_unchanged += unchanged
+        total_deleted += deleted
+
+        change_size = inserted + updated + deleted
+        if (not failed) and change_size <= 0:
+            continue
+        rows.append(
+            (
+                change_size,
+                gid,
+                remote,
+                inserted,
+                updated,
+                unchanged,
+                deleted,
+                failed,
+                str(getattr(s, "error", "") or "-"),
+            )
+        )
+
+    rows.sort(key=lambda x: (-x[0], x[1]))
+    for _change_size, gid, remote, inserted, updated, unchanged, deleted, failed, error in rows:
+        table.add_row(
+            gid,
+            str(remote),
+            str(inserted),
+            str(updated),
+            str(unchanged),
+            str(deleted),
+            ("失败" if failed else "正常"),
+            error,
+        )
+
+    if stats:
+        table.add_section()
+        table.add_row(
+            "合计",
+            str(total_remote),
+            str(total_inserted),
+            str(total_updated),
+            str(total_unchanged),
+            str(total_deleted),
+            (f"失败 {total_failed}" if total_failed else "正常"),
+            "-",
+        )
+    console.print(Panel(table, title=title, expand=False))
+
+
+def _print_search_results(query_raw: str, results: list[Any]) -> None:
+    table = Table(show_header=True, header_style="bold", box=None)
+    table.add_column("群组")
+    table.add_column("文件名")
+    table.add_column("上传者")
+    table.add_column("修改时间")
+    table.add_column("大小", justify="right")
+    table.add_column("文件夹")
+    table.add_column("ID")
+
+    for r in results:
+        folder_path = str(getattr(r, "folder_path", "") or "").strip().strip("/")
+        folder_show = "/" if not folder_path else f"/{folder_path}"
+        uploader_name = str(getattr(r, "uploader_name", "") or "")
+        uploader_id = int(getattr(r, "uploader_id", 0) or 0)
+        if uploader_id > 0 and uploader_name:
+            uploader_show = f"{uploader_name} (QQ:{uploader_id})"
+        elif uploader_id > 0:
+            uploader_show = f"QQ:{uploader_id}"
+        else:
+            uploader_show = uploader_name or "-"
+        table.add_row(
+            _fmt_group_display(str(getattr(r, "group_id", "")), str(getattr(r, "group_name", "") or "")),
+            str(getattr(r, "file_name", "")),
+            uploader_show,
+            _fmt_ts_local(getattr(r, "modify_time", 0)),
+            _fmt_size(getattr(r, "file_size", 0)),
+            folder_show,
+            str(getattr(r, "short_id", "")),
+        )
+
+    if not results:
+        console.print(Panel(f"查询 `{query_raw}` 没有命中。", title="搜索结果", expand=False))
+    else:
+        console.print(Panel(table, title=f"搜索结果：{query_raw}（{len(results)}）", expand=False))
 
 
 async def _sync_all(
@@ -557,6 +757,388 @@ def watch(
             await _interactive(cfg, fs, bot, syncer)
 
     _run_with_ws(console_level, cfg, runner)
+
+
+@app.command(help="更新本地索引缓存（默认 all）")
+def update_index(
+    target: str = typer.Argument("all", help="all 或群号：QQ-Group:123456 / 纯数字"),
+    config: str = typer.Option("config.toml", "--config", help="配置文件路径（推荐 TOML）"),
+) -> None:
+    cfg, console_level = _load_cfg_and_logging(config)
+    fs = FileSystemManager(cfg.file_system.local_path)
+    indexer = GroupFileIndexer(cfg, fs)
+
+    async def runner() -> None:
+        async with OneBotWsClient(cfg.onebot11.ws_url, cfg.onebot11.access_token) as bot:
+            with create_count_progress(console, description="索引更新中", transient=False) as progress:
+                task_id = progress.add_task("索引更新中", total=1, phase1_total=1, phase1_done=1)
+                total_groups = 1
+
+                def on_group_done(done: int, total: int, gid: str, ok: bool) -> None:
+                    nonlocal total_groups
+                    total_groups = max(1, int(total or 0))
+                    status = "OK" if ok else "FAIL"
+                    progress.update(
+                        task_id,
+                        total=total_groups,
+                        completed=int(done),
+                        phase1_total=1,
+                        phase1_done=1,
+                        description=f"索引更新中 [{status}] {gid}",
+                    )
+
+                stats = await indexer.update_index(
+                    bot,
+                    target=target,
+                    no_cache=True,
+                    on_group_done=on_group_done,
+                )
+                progress.update(
+                    task_id,
+                    total=total_groups,
+                    completed=total_groups,
+                    phase1_total=1,
+                    phase1_done=1,
+                    description="索引更新完成",
+                )
+        _print_index_update_stats(stats, title="索引更新完成")
+        console.print(f"索引库: {indexer.db_path}")
+        console.print(f"总记录数: {indexer.count_records()}")
+
+    try:
+        _run_with_ws(console_level, cfg, runner)
+    finally:
+        indexer.close()
+
+
+@app.command(name="index-info", help="查看本地索引统计信息")
+def index_info(
+    config: str = typer.Option("config.toml", "--config", help="配置文件路径（推荐 TOML）"),
+    id: str | None = typer.Option(None, "--id", help="短 ID（来自 search 结果）"),
+) -> None:
+    cfg, _console_level = _load_cfg_and_logging(config)
+    fs = FileSystemManager(cfg.file_system.local_path)
+    indexer = GroupFileIndexer(cfg, fs)
+    try:
+        if id:
+            rec = indexer.get_indexed_record_by_short_id(id)
+            if rec is None:
+                console.print(f"[red]未找到 ID[/red]: {id}")
+                raise typer.Exit(code=2)
+            folder_path = str(rec.folder_path or "").strip().strip("/")
+            folder_show = "/" if not folder_path else f"/{folder_path}"
+            rel_path = rec.file_name if folder_show == "/" else f"{folder_show}/{rec.file_name}"
+            table = Table(show_header=False, box=None)
+            table.add_column("项", style="bold")
+            table.add_column("值")
+            table.add_row("ID", rec.short_id)
+            table.add_row("群组", _fmt_group_display(rec.group_id, rec.group_name))
+            table.add_row("文件名", rec.file_name)
+            table.add_row("文件夹", folder_show)
+            table.add_row("完整路径", rel_path)
+            table.add_row("文件ID", rec.file_id)
+            table.add_row("文件类型(busid)", str(rec.busid))
+            table.add_row("文件大小", _fmt_size(rec.file_size))
+            table.add_row("上传者", f"{rec.uploader_name} (QQ:{rec.uploader_id})" if rec.uploader_id else (rec.uploader_name or "-"))
+            table.add_row("修改时间", _fmt_ts_local(rec.modify_time))
+            table.add_row("过期时间", _fmt_ts_local(rec.dead_time))
+            table.add_row("下载次数", str(rec.download_times))
+            table.add_row("md5", rec.md5 or "-")
+            table.add_row("alias", rec.alias or "-")
+            console.print(Panel(table, title=f"索引详情：{rec.short_id}", expand=False))
+            return
+
+        info = indexer.get_index_info()
+        try:
+            db_size = int(indexer.db_path.stat().st_size)
+        except Exception:
+            db_size = 0
+
+        table = Table(show_header=False, box=None)
+        table.add_column("项", style="bold")
+        table.add_column("值")
+        table.add_row("索引库路径", str(indexer.db_path))
+        table.add_row("索引群组数", str(info.total_groups))
+        table.add_row("总索引量（文件）", str(info.total_records))
+        table.add_row("估计索引文件总大小", _fmt_size(info.total_file_size))
+        table.add_row("平均文件大小", _fmt_size(info.avg_file_size))
+        table.add_row("索引库文件大小", _fmt_size(db_size))
+        table.add_row("最早修改时间", _fmt_ts_local(info.earliest_modify_time))
+        table.add_row("最近修改时间", _fmt_ts_local(info.latest_modify_time))
+        table.add_row("FTS5 状态", "启用" if bool(getattr(indexer, "_fts_available", False)) else "不可用")
+        console.print(Panel(table, title="索引信息", expand=False))
+
+        group_rows = indexer.list_indexed_groups_info()
+        if group_rows:
+            gtable = Table(show_header=True, header_style="bold", box=None)
+            gtable.add_column("群组")
+            gtable.add_column("文件数", justify="right")
+            gtable.add_column("总大小", justify="right")
+            gtable.add_column("更新时间")
+            for g in group_rows:
+                gtable.add_row(
+                    _fmt_group_display(g.group_id, g.group_name),
+                    str(g.file_count),
+                    _fmt_size(g.total_file_size),
+                    _fmt_ts_local(g.updated_at),
+                )
+            console.print(Panel(gtable, title=f"群组索引明细（{len(group_rows)}）", expand=False))
+    finally:
+        indexer.close()
+
+
+@app.command(name="get-file", help="按 group_id/file_id 下载群文件到 Download")
+def get_file(
+    targets: str = typer.Argument(..., help="group_id/file_id 或短ID，可逗号分隔"),
+    config: str = typer.Option("config.toml", "--config", help="配置文件路径（推荐 TOML）"),
+) -> None:
+    cfg, console_level = _load_cfg_and_logging(config)
+    fs = FileSystemManager(cfg.file_system.local_path)
+    indexer = GroupFileIndexer(cfg, fs)
+    try:
+        try:
+            target_tokens = _parse_get_file_target_tokens(targets)
+        except Exception as e:
+            console.print(f"[red]参数错误[/red]: {e}")
+            raise typer.Exit(code=2)
+
+        async def runner() -> None:
+            download_root = Path("Download").resolve()
+            download_root.mkdir(parents=True, exist_ok=True)
+            rows: list[tuple[str, str, str, str]] = []
+            resolved_targets: list[tuple[str, str]] = []
+            seen_targets: set[tuple[str, str]] = set()
+
+            for token in target_tokens:
+                if "/" in token:
+                    group_part, file_part = token.split("/", 1)
+                    group_part = group_part.strip()
+                    file_part = file_part.strip()
+                    if not group_part or not file_part:
+                        rows.append((token, token, "失败", "无效目标（应为 group_id/file_id）"))
+                        continue
+                    try:
+                        gid = _fmt_group_id_str(parse_group_numeric_id(group_part))
+                    except Exception:
+                        rows.append((token, token, "失败", f"无效群号: {group_part}"))
+                        continue
+                    fid = file_part if file_part.startswith("/") else f"/{file_part}"
+                    key = (gid, fid)
+                    if key in seen_targets:
+                        continue
+                    seen_targets.add(key)
+                    resolved_targets.append(key)
+                    continue
+
+                # 没有 "/" 的目标按短 ID 处理
+                rec = indexer.get_indexed_record_by_short_id(token)
+                if rec is None:
+                    rows.append((token, token, "失败", "无效短ID，且不符合 group_id/file_id"))
+                    continue
+                key = (rec.group_id, rec.file_id)
+                if key in seen_targets:
+                    continue
+                seen_targets.add(key)
+                resolved_targets.append(key)
+
+            resolved_records: list[Any] = []
+            for gid, fid in resolved_targets:
+                rec = indexer.get_indexed_record_by_group_file(gid, fid)
+                if rec is None:
+                    rows.append((gid, fid, "失败", "索引中不存在该文件（请先 update-index）"))
+                    continue
+                resolved_records.append(rec)
+
+            if resolved_records:
+                progress_ctx = create_progress(console, description="文件下载中", transient=False)
+                progress_ctx.start()
+                task_id = progress_ctx.add_task("文件下载中", total=0, phase1_total=1, phase1_done=1)
+            else:
+                progress_ctx = None
+                task_id = None
+
+            try:
+                async with OneBotWsClient(cfg.onebot11.ws_url, cfg.onebot11.access_token) as bot:
+                    limits = httpx.Limits(max_connections=4, max_keepalive_connections=4)
+                    async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(60.0), limits=limits) as client:
+                        progress_total_bytes = 0
+                        for rec in resolved_records:
+                            gid = rec.group_id
+                            fid = rec.file_id
+                            status = "FAIL"
+
+                            try:
+                                group_num = int(rec.group_id_num or parse_group_numeric_id(gid))
+                                url_res = await bot.call_api(
+                                    "get_group_file_url",
+                                    {"group_id": group_num, "file_id": rec.file_id, "busid": int(rec.busid or 0)},
+                                )
+                                _require_ok("get_group_file_url", url_res)
+                                url = str(((url_res.data or {}).get("url")) or "").strip()
+                                if not url:
+                                    raise RuntimeError("OneBot 未返回下载链接")
+
+                                group_dir = download_root / gid.replace(":", "_")
+                                group_dir.mkdir(parents=True, exist_ok=True)
+                                safe_name = _safe_download_name(rec.file_name or rec.file_id.strip("/"))
+                                dst = _dedupe_download_path(group_dir / safe_name)
+                                tmp = dst.with_suffix(dst.suffix + ".part")
+                                downloaded_this = 0
+                                planned_bytes = 0
+
+                                async with client.stream("GET", url) as resp:
+                                    resp.raise_for_status()
+                                    header_len = int(resp.headers.get("Content-Length") or 0)
+                                    if header_len > 0:
+                                        planned_bytes = header_len
+                                    else:
+                                        planned_bytes = max(int(rec.file_size or 0), 0)
+                                    if planned_bytes > 0:
+                                        progress_total_bytes += planned_bytes
+                                        if progress_ctx is not None and task_id is not None:
+                                            progress_ctx.update(
+                                                task_id,
+                                                total=progress_total_bytes,
+                                                phase1_total=1,
+                                                phase1_done=1,
+                                            )
+                                    async with aiofiles.open(tmp, "wb") as af:
+                                        async for chunk in resp.aiter_bytes():
+                                            await af.write(chunk)
+                                            chunk_len = len(chunk)
+                                            downloaded_this += chunk_len
+                                            if progress_ctx is not None and task_id is not None and chunk_len > 0:
+                                                progress_ctx.update(
+                                                    task_id,
+                                                    advance=chunk_len,
+                                                    phase1_total=1,
+                                                    phase1_done=1,
+                                                )
+                                if planned_bytes > downloaded_this:
+                                    progress_total_bytes -= (planned_bytes - downloaded_this)
+                                    if progress_ctx is not None and task_id is not None:
+                                        completed_now = float(progress_ctx.tasks[task_id].completed or 0)
+                                        progress_ctx.update(
+                                            task_id,
+                                            total=max(progress_total_bytes, int(completed_now)),
+                                            phase1_total=1,
+                                            phase1_done=1,
+                                        )
+                                elif downloaded_this > planned_bytes:
+                                    progress_total_bytes += (downloaded_this - planned_bytes)
+                                    if progress_ctx is not None and task_id is not None:
+                                        progress_ctx.update(
+                                            task_id,
+                                            total=progress_total_bytes,
+                                            phase1_total=1,
+                                            phase1_done=1,
+                                        )
+                                tmp.replace(dst)
+                                rows.append((gid, rec.file_name, "成功", str(dst)))
+                                status = "OK"
+                            except Exception as e:
+                                rows.append((gid, rec.file_name or fid, "失败", str(e)))
+                            finally:
+                                if progress_ctx is not None and task_id is not None:
+                                    progress_ctx.update(
+                                        task_id,
+                                        phase1_total=1,
+                                        phase1_done=1,
+                                        description=f"文件下载中 [{status}] {gid}",
+                                    )
+            finally:
+                if progress_ctx is not None and task_id is not None:
+                    progress_ctx.update(
+                        task_id,
+                        phase1_total=1,
+                        phase1_done=1,
+                        description="文件下载完成",
+                    )
+                    progress_ctx.stop()
+
+            table = Table(show_header=True, header_style="bold", box=None)
+            table.add_column("群组")
+            table.add_column("文件")
+            table.add_column("结果")
+            table.add_column("详情")
+            ok = 0
+            for gid, name, status, detail in rows:
+                if status == "成功":
+                    ok += 1
+                table.add_row(gid, name, status, detail)
+            console.print(Panel(table, title=f"下载结果：成功 {ok}/{len(rows)}", expand=False))
+            console.print(f"下载目录: {download_root}")
+
+        _run_with_ws(console_level, cfg, runner)
+    finally:
+        indexer.close()
+
+
+@app.command(help="在索引缓存中搜索群文件")
+def search(
+    keyword: list[str] = typer.Argument(None, help="查询表达式，可传多个"),
+    config: str = typer.Option("config.toml", "--config", help="配置文件路径（推荐 TOML）"),
+    refresh: bool = typer.Option(False, "--refresh", help="先通过 API 增量刷新索引，再执行搜索"),
+    strict: bool = typer.Option(False, "--strict", help="严格模式：禁用模糊搜索（仅精确匹配）"),
+) -> None:
+    cfg, console_level = _load_cfg_and_logging(config)
+    fs = FileSystemManager(cfg.file_system.local_path)
+    indexer = GroupFileIndexer(cfg, fs)
+    keyword = keyword or []
+
+    parsed_queries: list[Any] = []
+    for raw in keyword:
+        try:
+            parsed_queries.append(indexer.parse_query(raw))
+        except Exception as e:
+            console.print(f"[red]查询语法错误[/red] `{raw}`: {e}")
+            indexer.close()
+            raise typer.Exit(code=2)
+
+    async def refresh_runner() -> None:
+        async with OneBotWsClient(cfg.onebot11.ws_url, cfg.onebot11.access_token) as bot:
+            if not parsed_queries:
+                stats = await indexer.update_index(bot, target="all", no_cache=True)
+                _print_index_update_stats(stats, title="索引刷新完成")
+                return
+
+            group_filters = sorted({q.group_id for q in parsed_queries if getattr(q, "group_id", None)})
+            all_scoped = bool(parsed_queries) and all(bool(getattr(q, "group_id", None)) for q in parsed_queries)
+            if group_filters and all_scoped:
+                merged: dict[str, Any] = {}
+                for gid in group_filters:
+                    part = await indexer.update_index(bot, target=gid, no_cache=True)
+                    merged.update(part)
+                _print_index_update_stats(merged, title="索引刷新完成")
+            else:
+                stats = await indexer.update_index(bot, target="all", no_cache=True)
+                _print_index_update_stats(stats, title="索引刷新完成")
+
+    try:
+        if refresh:
+            _run_with_ws(console_level, cfg, refresh_runner)
+
+        if not parsed_queries:
+            if refresh:
+                console.print(f"索引库: {indexer.db_path}")
+                console.print(f"总记录数: {indexer.count_records()}")
+                return
+            console.print("请提供查询表达式，或使用 --refresh 先刷新索引。")
+            raise typer.Exit(code=2)
+
+        for q in parsed_queries:
+            try:
+                results = indexer.search(q, strict=strict, min_results=int(cfg.search.min_results))
+            except re.error as e:
+                console.print(f"[red]正则错误[/red] `{q.raw}`: {e}")
+                continue
+            except Exception as e:
+                logging.getLogger(__name__).exception("search failed: query=%s", q.raw)
+                console.print(f"[red]搜索失败[/red] `{q.raw}`: {e}")
+                continue
+            _print_search_results(q.raw, results)
+    finally:
+        indexer.close()
 
 
 if __name__ == "__main__":
