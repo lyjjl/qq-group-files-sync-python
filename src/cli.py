@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import signal
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,7 @@ from filesystem import FileSystemManager
 from indexer import GroupFileIndexer
 from onebot import OneBotWsClient, extract_plain_text, parse_group_numeric_id
 from pusher import GroupFilePusher
-from progress_ui import create_count_progress, create_progress
+from progress_ui import create_count_progress, create_progress, create_search_progress
 from syncer import GroupFileSyncer
 from ignore_rules import IgnoreMatcher
 from onebot_common import require_ok as _require_ok
@@ -302,15 +303,9 @@ def _print_index_update_stats(stats: dict[str, Any], *, title: str) -> None:
     console.print(Panel(table, title=title, expand=False))
 
 
-def _print_search_results(query_raw: str, results: list[Any]) -> None:
-    table = Table(show_header=True, header_style="bold", box=None)
-    table.add_column("群组")
-    table.add_column("文件名")
-    table.add_column("上传者")
-    table.add_column("修改时间")
-    table.add_column("大小", justify="right")
-    table.add_column("文件夹")
-    table.add_column("ID")
+def _print_search_results(query_raw: str, results: list[Any], elapsed_ms: float | None = None) -> None:
+    row_limit = 200
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
 
     for r in results:
         folder_path = str(getattr(r, "folder_path", "") or "").strip().strip("/")
@@ -323,20 +318,62 @@ def _print_search_results(query_raw: str, results: list[Any]) -> None:
             uploader_show = f"QQ:{uploader_id}"
         else:
             uploader_show = uploader_name or "-"
-        table.add_row(
-            _fmt_group_display(str(getattr(r, "group_id", "")), str(getattr(r, "group_name", "") or "")),
-            str(getattr(r, "file_name", "")),
-            uploader_show,
-            _fmt_ts_local(getattr(r, "modify_time", 0)),
-            _fmt_size(getattr(r, "file_size", 0)),
-            folder_show,
-            str(getattr(r, "short_id", "")),
+        rows.append(
+            (
+                _fmt_group_display(str(getattr(r, "group_id", "")), str(getattr(r, "group_name", "") or "")),
+                str(getattr(r, "file_name", "")),
+                uploader_show,
+                _fmt_ts_local(getattr(r, "modify_time", 0)),
+                _fmt_size(getattr(r, "file_size", 0)),
+                folder_show,
+                str(getattr(r, "short_id", "")),
+            )
         )
 
+    timing = f" | 耗时 {elapsed_ms:.1f} ms" if elapsed_ms is not None else ""
     if not results:
-        console.print(Panel(f"查询 `{query_raw}` 没有命中。", title="搜索结果", expand=False))
+        console.print(Panel(f"查询 `{query_raw}` 没有命中。", title=f"搜索结果{timing}", expand=False))
     else:
-        console.print(Panel(table, title=f"搜索结果：{query_raw}（{len(results)}）", expand=False))
+        # 与 --plan 一致
+        columns = (
+            ("群组", 12, 28),
+            ("文件名", 16, 40),
+            ("上传者", 12, 24),
+            ("修改时间", 16, 19),
+            ("大小", 8, 12),
+            ("文件夹", 12, 32),
+            ("ID", 6, 10),
+        )
+        widths: dict[str, int] = {}
+        for name, min_w, pref_w in columns:
+            widths[name] = pref_w
+        console_width = max(int(getattr(console, "width", 100) or 100), 60)
+        total = sum(widths.values()) + len(columns) * 3 + 4
+        overflow = max(0, total - console_width)
+        for name in ("文件名", "文件夹", "群组", "上传者", "修改时间", "大小", "ID"):
+            if overflow <= 0:
+                break
+            min_w = next(min_w for col, min_w, _ in columns if col == name)
+            can_reduce = max(0, widths[name] - min_w)
+            reduce_by = min(overflow, can_reduce)
+            widths[name] -= reduce_by
+            overflow -= reduce_by
+
+        table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
+        table.add_column("群组", width=widths["群组"], no_wrap=True, overflow="ellipsis")
+        table.add_column("文件名", width=widths["文件名"], no_wrap=True, overflow="ellipsis")
+        table.add_column("上传者", width=widths["上传者"], no_wrap=True, overflow="ellipsis")
+        table.add_column("修改时间", width=widths["修改时间"], no_wrap=True, overflow="ellipsis")
+        table.add_column("大小", width=widths["大小"], no_wrap=True, overflow="ellipsis", justify="right")
+        table.add_column("文件夹", width=widths["文件夹"], no_wrap=True, overflow="ellipsis")
+        table.add_column("ID", width=widths["ID"], no_wrap=True, overflow="ellipsis")
+
+        show_rows = rows[:row_limit]
+        for row in show_rows:
+            table.add_row(*row)
+        if len(rows) > row_limit:
+            table.add_row("...", f"...（已截断，剩余 {len(rows) - row_limit} 项）", "", "", "", "", "")
+        console.print(Panel(table, title=f"搜索结果：{query_raw}（{len(results)}）{timing}", expand=False))
 
 
 async def _sync_all(
@@ -815,6 +852,7 @@ def update_index(
 def index_info(
     config: str = typer.Option("config.toml", "--config", help="配置文件路径（推荐 TOML）"),
     id: str | None = typer.Option(None, "--id", help="短 ID（来自 search 结果）"),
+    detail: bool = typer.Option(False, "--detail", help="显示群组索引明细（默认不显示）"),
 ) -> None:
     cfg, _console_level = _load_cfg_and_logging(config)
     fs = FileSystemManager(cfg.file_system.local_path)
@@ -868,8 +906,8 @@ def index_info(
         table.add_row("FTS5 状态", "启用" if bool(getattr(indexer, "_fts_available", False)) else "不可用")
         console.print(Panel(table, title="索引信息", expand=False))
 
-        group_rows = indexer.list_indexed_groups_info()
-        if group_rows:
+        group_rows = [g for g in indexer.list_indexed_groups_info() if int(g.file_count or 0) > 0]
+        if detail and group_rows:
             gtable = Table(show_header=True, header_style="bold", box=None)
             gtable.add_column("群组")
             gtable.add_column("文件数", justify="right")
@@ -1086,24 +1124,43 @@ def search(
     indexer = GroupFileIndexer(cfg, fs)
     keyword = keyword or []
 
-    parsed_queries: list[Any] = []
+    def _split_compound_query(raw: str) -> list[str]:
+        s = str(raw or "").strip()
+        if not s:
+            return []
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        # 兼容常见写法：name::xxx,uploader::yyy
+        if len(parts) > 1 and any("::" in p for p in parts[1:]):
+            return parts
+        return [s]
+
+    query_groups: list[tuple[str, list[Any]]] = []
+    flat_queries: list[Any] = []
     for raw in keyword:
-        try:
-            parsed_queries.append(indexer.parse_query(raw))
-        except Exception as e:
-            console.print(f"[red]查询语法错误[/red] `{raw}`: {e}")
-            indexer.close()
-            raise typer.Exit(code=2)
+        parts = _split_compound_query(raw)
+        if not parts:
+            continue
+        parsed_group: list[Any] = []
+        for part in parts:
+            try:
+                parsed = indexer.parse_query(part)
+            except Exception as e:
+                console.print(f"[red]查询语法错误[/red] `{part}`: {e}")
+                indexer.close()
+                raise typer.Exit(code=2)
+            parsed_group.append(parsed)
+            flat_queries.append(parsed)
+        query_groups.append((",".join(parts), parsed_group))
 
     async def refresh_runner() -> None:
         async with OneBotWsClient(cfg.onebot11.ws_url, cfg.onebot11.access_token) as bot:
-            if not parsed_queries:
+            if not flat_queries:
                 stats = await indexer.update_index(bot, target="all", no_cache=True)
                 _print_index_update_stats(stats, title="索引刷新完成")
                 return
 
-            group_filters = sorted({q.group_id for q in parsed_queries if getattr(q, "group_id", None)})
-            all_scoped = bool(parsed_queries) and all(bool(getattr(q, "group_id", None)) for q in parsed_queries)
+            group_filters = sorted({q.group_id for q in flat_queries if getattr(q, "group_id", None)})
+            all_scoped = bool(flat_queries) and all(bool(getattr(q, "group_id", None)) for q in flat_queries)
             if group_filters and all_scoped:
                 merged: dict[str, Any] = {}
                 for gid in group_filters:
@@ -1118,7 +1175,7 @@ def search(
         if refresh:
             _run_with_ws(console_level, cfg, refresh_runner)
 
-        if not parsed_queries:
+        if not query_groups:
             if refresh:
                 console.print(f"索引库: {indexer.db_path}")
                 console.print(f"总记录数: {indexer.count_records()}")
@@ -1126,17 +1183,161 @@ def search(
             console.print("请提供查询表达式，或使用 --refresh 先刷新索引。")
             raise typer.Exit(code=2)
 
-        for q in parsed_queries:
-            try:
-                results = indexer.search(q, strict=strict, min_results=int(cfg.search.min_results))
-            except re.error as e:
-                console.print(f"[red]正则错误[/red] `{q.raw}`: {e}")
-                continue
-            except Exception as e:
-                logging.getLogger(__name__).exception("search failed: query=%s", q.raw)
-                console.print(f"[red]搜索失败[/red] `{q.raw}`: {e}")
-                continue
-            _print_search_results(q.raw, results)
+        total_queries = max(1, len(query_groups))
+        render_events: list[tuple[str, Any]] = []
+        with create_search_progress(console, description="搜索中", transient=False) as progress:
+            def _label(text: str, idx: int | None = None) -> str:
+                if total_queries <= 1:
+                    return text
+                if idx is None:
+                    return text
+                return f"查询 {idx}/{total_queries} | {text}"
+
+            task_id = progress.add_task(
+                "搜索中",
+                total=total_queries,
+                completed=0,
+                phase1_total=100,
+                phase1_done=0,
+                inner_label=_label("准备中", 0),
+            )
+            done = 0
+            for group_idx, (group_raw, group_queries) in enumerate(query_groups, start=1):
+                status = "OK"
+                progress.update(
+                    task_id,
+                    total=total_queries,
+                    completed=done,
+                    phase1_total=100,
+                    phase1_done=0,
+                    inner_label=_label(f"准备: {group_raw}", group_idx),
+                )
+                try:
+                    t0 = time.perf_counter()
+                    group_results: list[list[Any]] = []
+                    for sub_idx, q in enumerate(group_queries, start=1):
+                        def on_internal_progress(stage: str, inner_done: int, inner_total: int) -> None:
+                            progress.update(
+                                task_id,
+                                total=total_queries,
+                                completed=done,
+                                phase1_total=max(1, int(inner_total)),
+                                phase1_done=min(max(0, int(inner_done)), max(1, int(inner_total))),
+                                inner_label=_label(
+                                    f"条件 {sub_idx}/{len(group_queries)} {stage} {inner_done}/{inner_total}",
+                                    group_idx,
+                                ),
+                            )
+
+                        group_results.append(
+                            indexer.search(
+                                q,
+                                strict=strict,
+                                min_results=int(cfg.search.min_results),
+                                on_progress=on_internal_progress,
+                            )
+                        )
+
+                    if not group_results:
+                        results = []
+                    elif len(group_results) == 1:
+                        results = group_results[0]
+                    else:
+                        # 组合查询采用加权融合而不是硬交集：
+                        # 全命中优先，同时保留主要条件强命中 + 次要条件弱命中/未命中的候选
+                        cond_total = len(group_results)
+                        agg: dict[int, dict[str, float | int]] = {}
+                        row_obj: dict[int, Any] = {}
+                        for cond_idx, one in enumerate(group_results):
+                            total_one = max(1, len(one))
+                            for rank, item in enumerate(one, start=1):
+                                rid = int(getattr(item, "row_id", 0) or 0)
+                                if rid <= 0:
+                                    continue
+                                # 位置越靠前权重越高
+                                rank_score = 1.0 - float(rank - 1) / float(total_one)
+                                cond_weight = 1.15 if cond_idx == 0 else 1.0
+                                score_gain = (100.0 + 25.0 * rank_score) * cond_weight
+                                st = agg.get(rid)
+                                if st is None:
+                                    st = {"hits": 0, "score": 0.0, "rank_sum": 0.0}
+                                    agg[rid] = st
+                                st["hits"] = int(st["hits"]) + 1
+                                st["score"] = float(st["score"]) + float(score_gain)
+                                st["rank_sum"] = float(st["rank_sum"]) + float(rank_score)
+
+                                prev = row_obj.get(rid)
+                                if prev is None:
+                                    row_obj[rid] = item
+                                else:
+                                    prev_tag = str(getattr(prev, "match_tag", "") or "")
+                                    cur_tag = str(getattr(item, "match_tag", "") or "")
+                                    if prev_tag != "Exact" and cur_tag == "Exact":
+                                        row_obj[rid] = item
+
+                        ranked: list[tuple[Any, float, int, float]] = []
+                        for rid, st in agg.items():
+                            hits = int(st["hits"])
+                            coverage = float(hits) / float(max(1, cond_total))
+                            score = float(st["score"]) + 80.0 * coverage
+                            if hits == cond_total:
+                                score += 40.0
+                            ranked.append((row_obj[rid], score, hits, float(st["rank_sum"])))
+
+                        ranked.sort(
+                            key=lambda x: (
+                                -float(x[1]),
+                                -int(x[2]),
+                                -float(x[3]),
+                                str(getattr(x[0], "file_name", "") or "").lower(),
+                            )
+                        )
+                        full_hits: list[Any] = []
+                        partial_hits: list[Any] = []
+                        for item, _score, hits, _rank_sum in ranked:
+                            if int(hits) >= cond_total:
+                                full_hits.append(item)
+                            else:
+                                partial_hits.append(item)
+
+                        threshold_local = max(1, int(cfg.search.min_results))
+                        results = list(full_hits)
+                        if len(results) < threshold_local:
+                            need = threshold_local - len(results)
+                            results.extend(partial_hits[:need])
+                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                    render_events.append(("result", (group_raw, results, elapsed_ms)))
+                except re.error as e:
+                    status = "REGEX_ERR"
+                    render_events.append(("error", f"[red]正则错误[/red] `{group_raw}`: {e}"))
+                except Exception as e:
+                    status = "FAIL"
+                    logging.getLogger(__name__).exception("search failed: query=%s", group_raw)
+                    render_events.append(("error", f"[red]搜索失败[/red] `{group_raw}`: {e}"))
+                finally:
+                    done += 1
+                    progress.update(
+                        task_id,
+                        total=total_queries,
+                        completed=done,
+                        phase1_total=100,
+                        phase1_done=100,
+                        inner_label=_label(f"完成 [{status}]", group_idx),
+                    )
+            progress.update(
+                task_id,
+                total=total_queries,
+                completed=total_queries,
+                phase1_total=100,
+                phase1_done=100,
+                inner_label=_label("搜索完成", total_queries if total_queries > 1 else None),
+            )
+        for kind, payload in render_events:
+            if kind == "result":
+                raw, results, elapsed_ms = payload
+                _print_search_results(str(raw), list(results), elapsed_ms=float(elapsed_ms))
+            else:
+                console.print(str(payload))
     finally:
         indexer.close()
 

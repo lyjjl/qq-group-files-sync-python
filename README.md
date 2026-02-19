@@ -199,10 +199,12 @@ uv run main.py search "name::.*@QQ:123456"
 
 * `index-info` 可选参数：`--id <短ID>`
 * 不带 `--id` 时行为不变，显示索引汇总信息。
+* 群组索引明细默认不显示；需要加 `--detail` 才显示（会自动隐藏“文件数为 0”的群）。
 * 带 `--id` 时显示该条索引记录的详细信息（群组、文件名、文件夹、文件ID、busid、大小、上传者、修改时间、过期时间、下载次数、md5、alias 等）。
 
 ```bash
 uv run main.py index-info
+uv run main.py index-info --detail
 uv run main.py index-info --id R49
 ```
 
@@ -261,6 +263,14 @@ url_workers = 4
 download_workers = 4
 # 连续 invalid_url 次数阈值（达到后跳过该文件）
 invalid_url_threshold = 3
+
+[search]
+min_results = 5
+fuzzy_edit_distance = 2
+fuzzy_max_terms_per_token = 24
+index_db = ".index/group_files.db"
+# 外围元数据 CRUD 后端：auto | sqlite | peewee
+peripheral_crud_backend = "auto"
 ```
 
 ---

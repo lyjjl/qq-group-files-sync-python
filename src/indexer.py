@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -16,6 +17,7 @@ from typing import Any, Callable
 from config import AppConfig
 from filesystem import FileSystemManager
 from group_paths import group_relative_file_path, sanitize_component
+from peripheral_store import GroupIndexStore, build_group_index_store
 from onebot_common import require_ok as _require_ok
 from onebot import OneBotWsClient, parse_group_numeric_id
 
@@ -197,9 +199,18 @@ class GroupFileIndexer:
             pass
         self._conn = sqlite3.connect(str(self.db_path), timeout=10.0)
         self._conn.row_factory = sqlite3.Row
+        self._group_index_store: GroupIndexStore = build_group_index_store(
+            self.db_path,
+            self._conn,
+            backend=str(getattr(cfg.search, "peripheral_crud_backend", "auto")),
+        )
         self._prepare_db()
 
     def close(self) -> None:
+        try:
+            self._group_index_store.close()
+        except Exception:
+            pass
         try:
             self._conn.close()
         except Exception:
@@ -421,32 +432,20 @@ class GroupFileIndexer:
 
     def get_group_name(self, group_id: str) -> str:
         gid = normalize_group_id_input(group_id)
-        row = self._conn.execute(
-            "SELECT group_name FROM group_index_groups WHERE group_id = ?",
-            (gid,),
-        ).fetchone()
-        if not row:
-            return ""
-        return str(row["group_name"] or "").strip()
+        return self._group_index_store.get_group_name(gid)
 
     def list_indexed_groups_info(self) -> list[IndexedGroupInfo]:
-        rows = self._conn.execute(
-            """
-            SELECT group_id, group_id_num, group_name, file_count, total_file_size, updated_at
-            FROM group_index_groups
-            ORDER BY file_count DESC, total_file_size DESC, group_id ASC
-            """
-        ).fetchall()
+        rows = self._group_index_store.list_group_rows()
         out: list[IndexedGroupInfo] = []
         for r in rows:
             out.append(
                 IndexedGroupInfo(
-                    group_id=str(r["group_id"] or ""),
-                    group_id_num=int(r["group_id_num"] or 0),
-                    group_name=str(r["group_name"] or ""),
-                    file_count=int(r["file_count"] or 0),
-                    total_file_size=int(r["total_file_size"] or 0),
-                    updated_at=int(r["updated_at"] or 0),
+                    group_id=str(r.get("group_id") or ""),
+                    group_id_num=int(r.get("group_id_num") or 0),
+                    group_name=str(r.get("group_name") or ""),
+                    file_count=int(r.get("file_count") or 0),
+                    total_file_size=int(r.get("total_file_size") or 0),
+                    updated_at=int(r.get("updated_at") or 0),
                 )
             )
         return out
@@ -522,8 +521,7 @@ class GroupFileIndexer:
                 ok = False
                 # 即使文件抓取失败，也尽量保留群元信息，避免群名长期缺失。
                 if str(g.group_name or "").strip():
-                    with self._conn:
-                        self._update_group_index_row(gid, g.group_id_num, str(g.group_name or "").strip())
+                    self._update_group_index_row(gid, g.group_id_num, str(g.group_name or "").strip())
                 logging.getLogger(__name__).exception("index refresh failed: group=%s", gid)
                 result[gid] = IndexUpdateStats(failed=True, error=str(e))
             else:
@@ -538,8 +536,7 @@ class GroupFileIndexer:
                 if not group_name and files:
                     # 单群更新时若缺少群名，尽量沿用已有数据。
                     group_name = self.get_group_name(gid)
-                with self._conn:
-                    self._update_group_index_row(gid, g.group_id_num, group_name)
+                self._update_group_index_row(gid, g.group_id_num, group_name)
             finally:
                 done += 1
                 if on_group_done is not None:
@@ -552,8 +549,7 @@ class GroupFileIndexer:
             stale_groups = sorted(indexed_groups - remote_groups)
             for gid in stale_groups:
                 deleted = self._clear_group_exact(gid)
-                with self._conn:
-                    self._delete_group_index_row(gid)
+                self._delete_group_index_row(gid)
                 if deleted > 0:
                     result[gid] = IndexUpdateStats(
                         total_remote=0,
@@ -575,16 +571,96 @@ class GroupFileIndexer:
         seen_folder: set[str] = set()
         scan_complete = True
 
+        def _is_timeout_like_result(res: Any) -> bool:
+            try:
+                rc = int(getattr(res, "retcode", -1))
+            except Exception:
+                rc = -1
+            msg = f"{getattr(res, 'message', '')} {getattr(res, 'wording', '')}".lower()
+            return rc == 1200 or ("timeout" in msg) or ("timed out" in msg)
+
+        def _is_ok_result(res: Any) -> bool:
+            rc = getattr(res, "retcode", None)
+            st = getattr(res, "status", None)
+            return (rc == 0) and (st in {"ok", "OK", "", None})
+
+        async def _call_group_files_api(action: str, params: dict[str, Any], *, context: str) -> Any | None:
+            def _is_timeout_like_exc(exc: Exception) -> bool:
+                if isinstance(exc, asyncio.TimeoutError):
+                    return True
+                s = str(exc).lower()
+                return ("timeout" in s) or ("timed out" in s)
+
+            max_attempts = 4
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    res = await bot.call_api(action, params)
+                except Exception as e:
+                    timeout_like_exc = _is_timeout_like_exc(e)
+                    if timeout_like_exc and attempt < max_attempts:
+                        delay_s = min(3.0, 0.6 * attempt)
+                        logging.getLogger(__name__).warning(
+                            "index fetch timeout: group=%s %s attempt=%s/%s; retry in %.1fs",
+                            group_id_str,
+                            context,
+                            attempt,
+                            max_attempts,
+                            delay_s,
+                        )
+                        await asyncio.sleep(delay_s)
+                        continue
+                    if timeout_like_exc:
+                        logging.getLogger(__name__).warning(
+                            "index fetch timeout after retries: group=%s %s; mark as partial",
+                            group_id_str,
+                            context,
+                        )
+                        return None
+                    raise
+
+                if _is_ok_result(res):
+                    return res
+
+                if _is_timeout_like_result(res):
+                    if attempt < max_attempts:
+                        delay_s = min(3.0, 0.6 * attempt)
+                        logging.getLogger(__name__).warning(
+                            "index fetch timeout: group=%s %s attempt=%s/%s; retry in %.1fs",
+                            group_id_str,
+                            context,
+                            attempt,
+                            max_attempts,
+                            delay_s,
+                        )
+                        await asyncio.sleep(delay_s)
+                        continue
+                    logging.getLogger(__name__).warning(
+                        "index fetch timeout after retries: group=%s %s; mark as partial",
+                        group_id_str,
+                        context,
+                    )
+                    return None
+
+                _require_ok("get_group_files", res)
+            return None
+
         async def fetch(folder_id: str, folder_path: str) -> None:
             nonlocal scan_complete
             if folder_id:
-                res = await bot.call_api(
+                res = await _call_group_files_api(
                     "get_group_files_by_folder",
                     {"group_id": group_id_num, "folder_id": folder_id},
+                    context=f"folder_id={folder_id!r}",
                 )
             else:
-                res = await bot.call_api("get_group_root_files", {"group_id": group_id_num})
-            _require_ok("get_group_files", res)
+                res = await _call_group_files_api(
+                    "get_group_root_files",
+                    {"group_id": group_id_num},
+                    context="root",
+                )
+            if res is None:
+                scan_complete = False
+                return
             data = res.data or {}
 
             for f in (data.get("files", []) or []):
@@ -676,33 +752,16 @@ class GroupFileIndexer:
 
     def _update_group_index_row(self, group_id: str, group_id_num: int, group_name: str) -> None:
         file_count, total_file_size = self._group_index_stats(group_id)
-        now = int(time.time())
-        self._conn.execute(
-            """
-            INSERT INTO group_index_groups(group_id, group_id_num, group_name, file_count, total_file_size, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(group_id) DO UPDATE SET
-                group_id_num=excluded.group_id_num,
-                group_name=CASE
-                    WHEN excluded.group_name != '' THEN excluded.group_name
-                    ELSE group_index_groups.group_name
-                END,
-                file_count=excluded.file_count,
-                total_file_size=excluded.total_file_size,
-                updated_at=excluded.updated_at
-            """,
-            (
-                group_id,
-                int(group_id_num or 0),
-                str(group_name or "").strip(),
-                int(file_count),
-                int(total_file_size),
-                now,
-            ),
+        self._group_index_store.upsert_group(
+            group_id=group_id,
+            group_id_num=int(group_id_num or 0),
+            group_name=str(group_name or "").strip(),
+            file_count=int(file_count),
+            total_file_size=int(total_file_size),
         )
 
     def _delete_group_index_row(self, group_id: str) -> None:
-        self._conn.execute("DELETE FROM group_index_groups WHERE group_id = ?", (group_id,))
+        self._group_index_store.delete_group(group_id)
 
     def _upsert_group_files(
         self,
@@ -902,21 +961,49 @@ class GroupFileIndexer:
 
         return SearchQuery(raw=raw, search_by=search_by, keys=keys, group_id=group_id, uploader_id=uploader_id)
 
-    def search(self, query: SearchQuery, *, strict: bool = False, min_results: int | None = None) -> list[SearchResult]:
+    def search(
+        self,
+        query: SearchQuery,
+        *,
+        strict: bool = False,
+        min_results: int | None = None,
+        on_progress: Callable[[str, int, int], None] | None = None,
+    ) -> list[SearchResult]:
+        def _report(stage: str, done: int, total: int) -> None:
+            if on_progress is None:
+                return
+            try:
+                on_progress(stage, max(0, int(done)), max(1, int(total)))
+            except Exception:
+                pass
+
         threshold = max(1, int(self.min_results if min_results is None else min_results))
 
         if query.search_by == "time-period":
-            periods = [self._parse_time_period(k) for k in query.keys]
+            periods: list[tuple[int | None, int | None]] = []
+            key_total = max(1, len(query.keys))
+            _report("解析时间条件", 0, key_total)
+            for i, key in enumerate(query.keys, start=1):
+                periods.append(self._parse_time_period(key))
+                _report("解析时间条件", i, key_total)
+
+            _report("加载候选记录", 0, 1)
             rows = self._load_rows(query.group_id, query.uploader_id, periods=periods)
+            _report("加载候选记录", 1, 1)
             if not rows:
                 return []
 
             scored: list[tuple[sqlite3.Row, list[bool]]] = []
-            for row in rows:
+            row_total = len(rows)
+            step = max(1, row_total // 200)
+            _report("时间条件匹配", 0, row_total)
+            for i, row in enumerate(rows, start=1):
                 ts = int(row["upload_time"] or 0)
                 flags = [self._match_period(ts, start, end) for start, end in periods]
                 if any(flags):
                     scored.append((row, flags))
+                if i == row_total or i % step == 0:
+                    _report("时间条件匹配", i, row_total)
             return self._build_results(
                 scored,
                 query.keys,
@@ -924,33 +1011,44 @@ class GroupFileIndexer:
                 strict=strict,
                 threshold=threshold,
                 bm25_map={},
+                on_progress=on_progress,
             )
 
+        _report("加载候选记录", 0, 1)
         rows = self._load_rows(query.group_id, query.uploader_id)
+        _report("加载候选记录", 1, 1)
         if not rows:
             return []
 
         text_col = "file_name" if query.search_by == "name" else "uploader_name"
+        key_casefolds = [str(k or "").casefold() for k in query.keys]
         regex_patterns: list[re.Pattern[str] | None] = []
         fts_hits: list[set[int] | None] = []
-        for key in query.keys:
+        fuzzy_cache: dict[tuple[int, str], bool] = {}
+        key_total = max(1, len(query.keys))
+        _report("关键词预处理", 0, key_total)
+        for i, key in enumerate(query.keys, start=1):
             if self._has_regex_meta(key):
                 regex_patterns.append(re.compile(key))
                 fts_hits.append(None)
-                continue
-            regex_patterns.append(None)
-            fts_hits.append(
-                self._fts_key_rowids(
-                    search_by=query.search_by,
-                    key=key,
-                    group_id=query.group_id,
-                    uploader_id=query.uploader_id,
-                    strict=strict,
+            else:
+                regex_patterns.append(None)
+                fts_hits.append(
+                    self._fts_key_rowids(
+                        search_by=query.search_by,
+                        key=key,
+                        group_id=query.group_id,
+                        uploader_id=query.uploader_id,
+                        strict=strict,
+                    )
                 )
-            )
+            _report("关键词预处理", i, key_total)
 
         scored2: list[tuple[sqlite3.Row, list[bool]]] = []
-        for row in rows:
+        row_total = len(rows)
+        step = max(1, row_total // 200)
+        _report("候选匹配", 0, row_total)
+        for i, row in enumerate(rows, start=1):
             row_id = int(row["id"])
             text = str(row[text_col] or row["uploader"] or "")
             text_fold = text.casefold()
@@ -961,16 +1059,31 @@ class GroupFileIndexer:
                     flags.append(bool(p.search(text)))
                     continue
 
-                literal_hit = key.casefold() in text_fold
+                literal_hit = key_casefolds[idx] in text_fold
                 hits = fts_hits[idx]
                 fuzzy_hit = hits is not None and row_id in hits
-                fuzzy_text_hit = (not strict) and self._fuzzy_text_match(key, text)
+                # 命中短路：字面/FTS 已命中时，不再执行高开销文本模糊匹配。
+                if literal_hit or fuzzy_hit:
+                    flags.append(True)
+                    continue
+                if strict:
+                    flags.append(False)
+                    continue
                 # 兼容旧行为：子串匹配始终作为基线召回；FTS/模糊用于补充召回与排序。
-                flags.append(literal_hit or fuzzy_hit or fuzzy_text_hit)
+                ckey = (idx, text)
+                cached = fuzzy_cache.get(ckey)
+                if cached is None:
+                    cached = self._fuzzy_text_match(key, text)
+                    fuzzy_cache[ckey] = cached
+                flags.append(cached)
             if any(flags):
                 scored2.append((row, flags))
+            if i == row_total or i % step == 0:
+                _report("候选匹配", i, row_total)
 
+        _report("相关性打分", 0, 1)
         bm25_map = self._bm25_map(query, strict=strict)
+        _report("相关性打分", 1, 1)
         return self._build_results(
             scored2,
             query.keys,
@@ -978,6 +1091,7 @@ class GroupFileIndexer:
             strict=strict,
             threshold=threshold,
             bm25_map=bm25_map,
+            on_progress=on_progress,
         )
 
     def _load_rows(
@@ -1026,7 +1140,6 @@ class GroupFileIndexer:
             FROM group_files AS gf
             LEFT JOIN group_index_groups AS gg ON gg.group_id = gf.group_id
             {where_sql}
-            ORDER BY gf.file_name COLLATE NOCASE ASC
             """,
             tuple(params),
         ).fetchall()
@@ -1041,17 +1154,31 @@ class GroupFileIndexer:
         strict: bool,
         threshold: int,
         bm25_map: dict[int, float],
+        on_progress: Callable[[str, int, int], None] | None = None,
     ) -> list[SearchResult]:
+        def _report(stage: str, done: int, total: int) -> None:
+            if on_progress is None:
+                return
+            try:
+                on_progress(stage, max(0, int(done)), max(1, int(total)))
+            except Exception:
+                pass
+
         if not scored:
             return []
 
         exact_rows: list[tuple[sqlite3.Row, list[bool]]] = []
         fuzzy_rows: list[tuple[sqlite3.Row, list[bool]]] = []
-        for row, flags in scored:
+        scored_total = len(scored)
+        step = max(1, scored_total // 200)
+        _report("分类命中结果", 0, scored_total)
+        for i, (row, flags) in enumerate(scored, start=1):
             if all(flags):
                 exact_rows.append((row, flags))
             elif any(flags):
                 fuzzy_rows.append((row, flags))
+            if i == scored_total or i % step == 0:
+                _report("分类命中结果", i, scored_total)
 
         sim_cache: dict[int, float] = {}
 
@@ -1083,10 +1210,22 @@ class GroupFileIndexer:
             bm25 = float(bm25_map.get(row_id, 1e18))
             return (-sim, -matched_count, positions, bm25, str(row["file_name"] or "").lower())
 
+        _report("排序精确结果", 0, 1)
         exact_rows.sort(key=_exact_sort_key)
+        _report("排序精确结果", 1, 1)
+        _report("排序模糊结果", 0, 1)
         fuzzy_rows.sort(key=_fuzzy_sort_key)
+        _report("排序模糊结果", 1, 1)
 
-        out: list[SearchResult] = [self._row_to_result(r, f, match_tag="Exact") for r, f in exact_rows]
+        out: list[SearchResult] = []
+        exact_total = len(exact_rows)
+        if exact_total > 0:
+            step_exact = max(1, exact_total // 200)
+            _report("构建输出结果", 0, exact_total)
+            for i, (row, flags) in enumerate(exact_rows, start=1):
+                out.append(self._row_to_result(row, flags, match_tag="Exact"))
+                if i == exact_total or i % step_exact == 0:
+                    _report("构建输出结果", i, exact_total)
         if strict:
             return out
 
@@ -1094,8 +1233,15 @@ class GroupFileIndexer:
             return out
 
         need = threshold - len(out)
-        for row, flags in fuzzy_rows[:need]:
-            out.append(self._row_to_result(row, flags, match_tag="Fuzzy"))
+        fuzzy_take = fuzzy_rows[:need]
+        fuzzy_total = len(fuzzy_take)
+        if fuzzy_total > 0:
+            step_fuzzy = max(1, fuzzy_total // 200)
+            _report("补齐模糊结果", 0, fuzzy_total)
+            for i, (row, flags) in enumerate(fuzzy_take, start=1):
+                out.append(self._row_to_result(row, flags, match_tag="Fuzzy"))
+                if i == fuzzy_total or i % step_fuzzy == 0:
+                    _report("补齐模糊结果", i, fuzzy_total)
         return out
 
     def _row_to_result(self, row: sqlite3.Row, flags: list[bool], *, match_tag: str) -> SearchResult:
@@ -1240,7 +1386,14 @@ class GroupFileIndexer:
         clauses: list[str] = []
         for token in tokens:
             terms: set[str] = set(self._term_variants(token))
-            if not strict and self.fuzzy_edit_distance > 0:
+            allow_expand = (not strict) and self.fuzzy_edit_distance > 0
+            if allow_expand and search_by == "uploader":
+                if re.fullmatch(r"[\u4e00-\u9fff]", token):
+                    allow_expand = False
+                elif re.fullmatch(r"[0-9a-z]{1,2}", token):
+                    allow_expand = False
+
+            if allow_expand:
                 for variant in list(terms):
                     for near in self._expand_term_by_distance(variant, self.fuzzy_edit_distance):
                         terms.add(near)
@@ -1337,6 +1490,21 @@ class GroupFileIndexer:
             return False
         if needle in hay:
             return True
+
+        # 中英混合关键词优先按中文子串做无序覆盖，兼顾容错与精度。
+        needle_has_cjk = bool(re.search(r"[\u4e00-\u9fff]", needle))
+        needle_has_ascii = bool(re.search(r"[0-9a-z]", needle))
+        if needle_has_cjk and needle_has_ascii:
+            needle_cjk = "".join(re.findall(r"[\u4e00-\u9fff]", needle))
+            hay_cjk = "".join(re.findall(r"[\u4e00-\u9fff]", hay))
+            if needle_cjk and hay_cjk:
+                need = Counter(needle_cjk)
+                have = Counter(hay_cjk)
+                if all(have.get(ch, 0) >= cnt for ch, cnt in need.items()):
+                    return True
+            # 混合词若中文主干都对不上，直接判定不命中，避免被纯英文窗口编辑距离误召回。
+            return False
+
         if len(needle) <= 1:
             return False
 
@@ -1573,11 +1741,16 @@ class GroupFileIndexer:
         if re.fullmatch(r"\d{10}", s):
             return int(s)
 
-        # 日期（本地时区）
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-            d = datetime.strptime(s, "%Y-%m-%d").date()
+        # 日期（本地时区），支持 YYYY-MM-DD 与 YYYY-M-D
+        m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+        if m:
+            y, mo, d = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            try:
+                date_obj = datetime(y, mo, d).date()
+            except ValueError as e:
+                raise ValueError(f"非法日期: {s}") from e
             t = dt_time(23, 59, 59) if is_end else dt_time(0, 0, 0)
-            dt = datetime.combine(d, t).astimezone()
+            dt = datetime.combine(date_obj, t).astimezone()
             return int(dt.timestamp())
 
         # 完整 ISO 时间
@@ -1609,7 +1782,7 @@ class GroupFileIndexer:
                 if self._fts_available:
                     self._conn.execute("DELETE FROM group_files_fts WHERE rowid = ?", (row_id,))
             self._conn.execute("DELETE FROM group_files WHERE group_id = ?", (group_id,))
-            self._delete_group_index_row(group_id)
+        self._delete_group_index_row(group_id)
         if not ids:
             return 0
         return len(ids)

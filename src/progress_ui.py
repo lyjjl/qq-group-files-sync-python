@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from rich.console import Console
 from rich.progress import MofNCompleteColumn, Progress, ProgressColumn, Task, TextColumn, TimeElapsedColumn
+from rich.table import Column
 from rich.text import Text
 
 
@@ -81,6 +82,23 @@ def create_count_progress(
         TextColumn(f"{description}"),
         DualPhaseBarColumn(bar_width=bar_width),
         MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=transient,
+    )
+
+
+def create_search_progress(
+    console: Console,
+    *,
+    description: str = "搜索中",
+    transient: bool = False,
+) -> Progress:
+    bar_width = max(20, min(60, int(console.width) - 40)) if getattr(console, "width", None) else 40
+    return Progress(
+        TextColumn(f"{description}"),
+        DualPhaseBarColumn(bar_width=bar_width),
+        TextColumn("{task.fields[inner_label]}", table_column=Column(no_wrap=True)),
         TimeElapsedColumn(),
         console=console,
         transient=transient,

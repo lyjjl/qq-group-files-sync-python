@@ -100,6 +100,11 @@ class SearchConfig(BaseModel):
         alias="indexDb",
         description="索引数据库路径（相对路径将以 file_system.local_path 为基准）",
     )
+    peripheral_crud_backend: str = Field(
+        default="auto",
+        alias="peripheralCrudBackend",
+        description="外围元数据 CRUD 后端：auto | sqlite | peewee",
+    )
 
 
 class AppConfig(BaseModel):
@@ -143,6 +148,7 @@ def default_config() -> AppConfig:
             fuzzy_edit_distance=2,
             fuzzy_max_terms_per_token=24,
             index_db=".index/group_files.db",
+            peripheral_crud_backend="auto",
         ),
         groups=[
             GroupConfig(
@@ -313,6 +319,8 @@ def render_config_toml(cfg: AppConfig) -> str:
     lines.append(f"fuzzy_max_terms_per_token = {int(cfg.search.fuzzy_max_terms_per_token)}")
     lines.append("# 索引数据库路径（相对路径基于 file_system.local_path）")
     lines.append(f"index_db = {_toml_quote(cfg.search.index_db)}")
+    lines.append("# 外围元数据 CRUD 后端：auto | sqlite | peewee")
+    lines.append(f"peripheral_crud_backend = {_toml_quote(str(cfg.search.peripheral_crud_backend or 'auto'))}")
     lines.append("")
 
     return "\n".join(lines)
